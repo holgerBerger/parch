@@ -10,7 +10,7 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-- **Builds green (2026-11, Phase 0 done):** 40/40 tests default; 46/46 with `-DARCH_WITH_URING=ON`. The policy flag is set inside CMakeLists (`CMAKE_POLICY_VERSION_MINIMUM`), not required on the command line anymore.
+- **Builds green (2026-11, Phases 0–3 done):** 51/51 tests default; 57/57 with `-DARCH_WITH_URING=ON`. The policy flag is set inside CMakeLists (`CMAKE_POLICY_VERSION_MINIMUM`), not required on the command line anymore.
 - CMake 3.22+, C++20 compiler. Note: GCC 15 rejects `opts = {}` default arguments for nested classes with only implicit ctors — `writer::options` has an explicit `options() {}` for this; don't remove it. Default build is plain POSIX — **liburing is NOT required**.
 - io_uring backend is opt-in: `-DARCH_WITH_URING=ON` (needs `liburing-devel`/`liburing-dev` via pkg-config) and pulls in `src/io/io_uring_pool.cpp`, `src/io/prefetch.cpp` + their tests.
 - All other deps (spdlog, zstd, crc32c, xxHash) are fetched via FetchContent — no manual install needed.
@@ -24,7 +24,7 @@ include/arch/        — public API headers (format, compressor, archive, io pip
 include/util/        — xattr + ACL helpers
 src/archive/         — writer/reader high-level implementation (both in writer.cpp for now)
 src/compress/        — compressor factory + zstd impl
-src/io/              — file-I/O pipeline (planned); io_uring pool + prefetcher (ARCH_WITH_URING only)
+src/io/              — pipeline.cpp (Phase 3, always built); io_uring pool + prefetcher (ARCH_WITH_URING only)
 src/util/            — xattr implementation
 test/                — Catch2 tests (one file per subsystem; io_uring tests gated on ARCH_WITH_URING)
 docs/                — format spec, test plan, API reference
@@ -36,7 +36,7 @@ docs/                — format spec, test plan, API reference
 
 - **writer / reader** use pimpl (`writer::impl`, `reader::impl`) defined inside `writer.cpp`.
 - **Archive format**: seek-based (no streaming format), but writes are **streamed** — blocks `pwrite`d as produced, only TOC metadata + dedup index buffered in RAM. Layout is `archive_header (16B) → [self-contained TOC sections: data blocks + file entries + block entries + string table (+ dedup index)] → TOC table → footer (256B at EOF)`. Spec: `docs/format.md` **v0.2** (2026-11 freeze) — `format.h`, the writer serializers, and the size/conformance tests are all on v0.2.
-- **I/O pipeline (planned, Phase 3)**: worker-thread pool stats/opens/preads **N files concurrently** (the network-FS latency fix — across files, not within one), feeding a block-compression pool sized by `options.threads`. zstd runs `nbWorkers=1`; the pool is the parallelism knob.
+- **I/O pipeline (Phase 3, `arch::io::pipeline`, always built)**: `files_in_flight` worker threads open+fstat+pread **N files concurrently** (the network-FS latency fix — across files, not within one), each raw block is XXH3-hashed (dedup) and handed to `options.threads` compression workers writing into per-file ordered slots; the writer consumes in submit order (single consumer ⇒ archive bytes are scheduling-independent). Bounded memory: `block_permits` live blocks + per-file liveness cap. `writer::add_tree` routes regular files through it; `options.threads = 0` selects the serial fallback. zstd runs `nbWorkers=1`; the pool is the parallelism knob.
 - **io_uring backend (optional, `ARCH_WITH_URING=ON`)**: `io_uring_pool` wraps a raw io_uring ring, dispatches callbacks via an `unordered_map` of tag→callback (CQE reaping serialized under `m_cq_mtx`); the `prefetcher` does within-file readahead on it. Slated to become one backend of the pipeline interface — not the primary path.
 - **Compressor plugin system**: factory registry (`register_compressor` / `make_compressor`) with `REGISTER_COMPRESSOR` macro for static init. Each compressor works on single 4 MiB blocks; codec **and level are pinned per TOC section** (Phase 1).
 
@@ -63,6 +63,14 @@ docs/                — format spec, test plan, API reference
 - **Serializers are field-by-field** per `docs/format.md` offset tables (`serialize_file_entry` etc. in an anonymous namespace with size `abort()` guards) — never `memcpy` a struct. `test/test_writer_serialize.cpp` re-parses archives independently.
 - **String table byte 0 is a reserved NUL sentinel** (`add_string` starts at offset ≥ 1; 0 = "absent" in all ref fields). Xattr/ACL blobs also live in the string table (`add_blob`, no NUL — the xattr format self-terminates); lengths are big-endian per spec (`src/util/xattr.cpp` now matches).
 - **`writer::append()` throws not-implemented** — needs the reader-side footer parser (Phase 4).
+
+### `pipeline.cpp` — Phase 3 notes
+- **Consumption contract** (`include/arch/pipeline.h`): `submit()` → repeated `next_block(seq, i, blk)` + `release_block(seq)` → `wait_file_done(seq)` exactly once. `next_block` only returns false at a real gap: it waits for the slot, the file error, or `io_done && queued_raw == 0 && in_compress == 0` (don't simplify this — waking on `io_done` alone was a race that lost the last block when compression lagged behind I/O).
+- **Permit accounting is exactly-once**: io_worker acquires before each pread; release happens in `release_block` (writer), in the compress worker's drop paths (error / slot vanished / file erased — it re-looks-up `seq` under the store lock), or in `wait_file_done` (stranded slots only: `permits_held - queued_raw - in_compress`). Any change must keep those three disjoint.
+- **Liveness bound**: `files_in_flight * per_file_cap < block_permits` (enforced by the ctor by scaling permits up). Without the per-file cap the head file's io thread can starve behind the other in-flight files and the writer deadlocks in `next_block`.
+- The pipeline takes its **own fstat** (submit's size arg is only a slot-count estimate) and reads xattrs/ACLs in the io worker — those round-trips are part of what cross-file concurrency hides. Writer metadata comes from the terminal `pipeline_file`.
+- `add_tree` error path reaps in-flight files (`reap_rest`) so the writer stays usable after a throw; `wait_file_done` on an already-erased seq is a safe no-op.
+- **Linking note**: `REGISTER_COMPRESSOR` uses static initializers — consumers linking `libarchiver_lib.a` statically must use `-Wl,--whole-archive` (or reference a `zstd_impl` symbol) or `make_compressor("zstd")` fails at runtime. Phase 5 CLI should link accordingly or add explicit registration.
 
 ### Resolved (was: Phase 0 compile blockers)
 - `format.h`: renamed `BLOCK_SIZE` → `ARCH_BLOCK_SIZE` (collides with `sys/mount.h` macro); ported to v0.2 layouts (48 B `block_entry` w/ 16-byte `digest128 content_id`, 128 B `file_entry` w/ `symlink_target_id`/`link_target_id`, 128 B `toc_header`, canonical `*_SIZE` constants). Structs are in-memory helpers — never `memcpy`'d; `file_entry` declaration order groups u64→u32→u16 + tail pad to hit exactly 128 B (serialization order follows docs/format.md tables instead).
@@ -91,4 +99,4 @@ docs/                — format spec, test plan, API reference
 - Tests use `mkstemp` for temp files (not Catch2's file helpers).
 
 ## Phase Checklist (current status)
-See PLAN.md for full status. In short: **Phases 0–2 ✅** (builds green; `format.h` on v0.2; writer streams + serializes spec-conformant archives with `add_tree`, verified by independent re-parse tests — 43/43 default, 49/49 `ARCH_WITH_URING=ON`), pipeline ❌ (not written — Phase 3, the network-FS fast path), reader ❌ (stubs — Phase 4; also carries the deferred `writer::append`), CLI ⚠️ (stub `main.cpp` — Phase 5). Next up: **Phase 3 (I/O pipeline)** → Phase 4 (reader) → Phase 5 (CLI).
+See PLAN.md for full status. In short: **Phases 0–3 ✅** (builds green; `format.h` on v0.2; writer streams + serializes spec-conformant archives with pipelined `add_tree` — 51/51 default, 57/57 `ARCH_WITH_URING=ON`; pipeline is ASan/UBSan-clean and byte-identical to the serial path), reader ❌ (stubs — Phase 4; also carries the deferred `writer::append`), CLI ⚠️ (stub `main.cpp` — Phase 5). Next up: **Phase 4 (reader)** → Phase 5 (CLI).

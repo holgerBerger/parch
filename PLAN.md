@@ -64,10 +64,11 @@ compression and random per-file access. See `docs/format.md` for the full spec
 | zstd implementation | ✅ Compiles & passes roundtrip tests — header self-contained; real APIs (`ZSTD_c_nbWorkers=1`, `ZSTD_c_compressionLevel`, `crc32c::Crc32c/Extend`); level is the constructor arg (pinned per section in Phase 2) |
 | io_uring pool | ✅ **Optional backend** (`ARCH_WITH_URING=ON`, default OFF) compiles, tests pass (46/46, 100× stress, ASan/UBSan-clean). Fixed: `<liburing.h>`, `next_tag` as member, removed `io_uring_queue_quiesce`, **`io_uring_queue_init` misuse (CQ depth passed as FLAGS ⇒ `IORING_SETUP_R_DISABLED` ring that never completed anything)**, **`drain_and_stop` deadlock** (timed waits + pending-op counter + condvar), and **a CQE-consumption race** (liburing completion reaping is not thread-safe; workers had double-consumed CQEs ⇒ callbacks fired twice ⇒ use-after-free — now serialized under a dedicated reaping mutex, callbacks dispatched outside it). Callback registry is now `unordered_map` (former O(N) perf item, done). |
 | Prefetcher | ✅ **To be superseded** by the thread-pool file pipeline (Phase 3); this io_uring variant stays as the optional backend. Fixed the compile error (raw `new` + `.get()`), the `delete`+`erase` double-free, and a **permanent block in `pop_ready_chunk`** (`m_eof` was only set on a branch that non-empty files never reached). Chunk ownership rewritten to `shared_ptr` held by the io callback itself — the kernel read buffer and completion flag can no longer be freed underneath the worker (was a use-after-free). |
-| Archive writer | ✅ **Serialized (Phase 2)** — blocks `pwrite`d as produced (only TOC metadata + dedup index in RAM), section-relative offsets, field-by-field big-endian TOC/footer via `htobe*_safe`, metadata CRC + footer CRC + signature CRC, durable fsync ordering, `add_tree()` with dirs/symlinks/`symlink_target_id`/hardlink `link_target_id`, dedup wired into both `add_file` paths. Spec conformance test (`test/test_writer_serialize.cpp`) re-parses archives from the offset tables. `append()` deferred to Phase 4 (needs the footer parser). |
+| Archive writer | ✅ **Serialized (Phase 2) + pipelined (Phase 3)** — blocks `pwrite`d as produced (only TOC metadata + dedup index in RAM), section-relative offsets, field-by-field big-endian TOC/footer via `htobe*_safe`, metadata CRC + footer CRC + signature CRC, durable fsync ordering, `add_tree()` with dirs/symlinks/`symlink_target_id`/hardlink `link_target_id`, dedup wired into both `add_file` paths. Spec conformance test (`test/test_writer_serialize.cpp`) re-parses archives from the offset tables. `add_tree` regular files stream through the Phase 3 pipeline (`consume_pipelined_file`), byte-identical to the serial fallback (`threads = 0`). `append()` deferred to Phase 4 (needs the footer parser). |
+| I/O pipeline (`arch::io::pipeline`) | ✅ **Done (Phase 3)** — `include/arch/pipeline.h` + `src/io/pipeline.cpp`, always built, plain POSIX: `pipeline_depth` files in flight (open+fstat+xattr+pread), `threads` compression workers, bounded memory via `block_permits` with a per-file liveness cap, submit-order consumption, deterministic bytes, failed-file reaping. Benchmarked: 200 MiB / 200-file tree 0.18 s → 0.04 s (page cache); ASan/UBSan-clean. |
 | Xattr util | ⚠️ Partial — `read_xattrs` via `listxattr`/`getxattr`, binary blob format written. `write_xattrs` and ACL functions are skeletons. Compiles. |
 | CMake (FetchContent) | ✅ Configures & builds from scratch: policy-version workaround for crc32c, Catch2 `extras/` module path + `include(Catch)`, `spdlog::spdlog` target, `SOURCE_SUBDIR` for zstd (`build/cmake`) and xxHash (`cmake_unofficial`), `option(ARCH_WITH_URING OFF)` gating pool/prefetch sources + tests. |
-| Tests (Catch2) | ✅ **40/40 passing** (default) / **46/46** (`ARCH_WITH_URING=ON`) — `Catch2WithMain` linked, `test_toc_serialize.cpp` created, `zstd_mt`→`zstd_impl`, crc32c/`make_compressor` API usages real, io_uring tests gated on the flag. |
+| Tests (Catch2) | ✅ **51/51 passing** (default) / **57/57** (`ARCH_WITH_URING=ON`) — includes `test/test_pipeline.cpp` (ordered multi-block delivery, errors, empty files, backpressure bounds, dtor-during-inflight, writer recovery + serial/pipeline byte-identity). |
 | CLI (`src/main.cpp`) | ⚠️ Stub exists (usage banner; commands land in Phase 5) so the `arch` target builds |
 | Test plan (`docs/testing.md`) | ✅ Complete — 50+ planned future tests with priorities |
 
@@ -105,7 +106,7 @@ include/
   arch/format.h            — on-disk struct definitions (in-memory helpers over canonical layout)
   arch/compressor.h        — compressor base class + factory
   arch/zstd_impl.h         — zstd implementation
-  arch/io.h                — file-I/O pipeline interface (planned, Phase 3)
+  arch/pipeline.h          — file-I/O + compression pipeline (Phase 3, plain POSIX)
   arch/io_uring_pool.h     — io_uring submit/completion wrapper (backend, ARCH_WITH_URING)
   arch/prefetch.h          — io_uring readahead prefetcher (backend, ARCH_WITH_URING)
   arch/archive.h           — writer/reader high-level API
@@ -116,7 +117,7 @@ src/
   archive/writer.cpp       — writer::impl (add_file, finalize, reader stubs)
   compress/compressor.cpp  — factory registry
   compress/zstd_impl.cpp   — zstd compress/decompress + CRC
-  io/pipeline.cpp          — thread-pool stat/open/pread pipeline (planned, Phase 3)
+  io/pipeline.cpp          — thread-pool open/pread/compression pipeline (Phase 3)
   io/io_ring_pool.cpp      — io_uring SQE/CQE dispatch (ARCH_WITH_URING=ON only)
   io/prefetch.cpp          — windowed async readahead (ARCH_WITH_URING=ON only)
   util/xattr.cpp           — listxattr/getxattr/setxattr
@@ -141,14 +142,15 @@ docs/
 
 ## Remaining work (ordered)
 
-> **Phases 0–2 ✅ (2026-11):** the project configures, compiles, and tests
-> green (43/43 default, 49/49 `-DARCH_WITH_URING=ON`); docs, `format.h`, and
-> tests are on the frozen v0.2 layout; and the writer now *streams*
-> spec-conformant archives (TOC/footer serialization, dedup, `add_tree`),
-> verified by an independent re-parse test. Next up is **Phase 3 (I/O
-> pipeline)**; the reader and CLI come *after*, since they parse bytes the
-> writer now produces — `writer::append()` lands with the reader's footer
-> parser in Phase 4.
+> **Phases 0–3 ✅ (2026-11):** the project configures, compiles, and tests
+> green (51/51 default, 57/57 `-DARCH_WITH_URING=ON`); docs, `format.h`, and
+> tests are on the frozen v0.2 layout; the writer *streams* spec-conformant
+> archives (TOC/footer serialization, dedup, `add_tree`) verified by an
+> independent re-parse test; and `add_tree` now runs regular files through
+> the Phase 3 file-level I/O + compression pipeline (`arch::io::pipeline`)
+> — byte-identical to the serial path, ~4.5× faster on a 200-file local
+> bench. Next up is **Phase 4 (reader + `writer::append()`)**; the CLI comes
+> after.
 >
 > **Design decisions frozen (2026-11):** io_uring demoted to an optional
 > backend (`ARCH_WITH_URING`, default OFF) — the primary I/O path is a
@@ -300,7 +302,22 @@ block CRCs + decompress roundtrip, dedup single-store, tree relative paths).
     compressor" semantics).
 20. **(Optional) io_uring backend** — with `ARCH_WITH_URING=ON`, implement
     the same pipeline interface on `io_uring_pool` (fix its O(N) callback
-    vector → hash map first) for a local-NVMe fast path.
+    vector → hash map first) for a local-NVMe fast path. **Deferred**: the
+    map fix landed with Phase 0; the backend itself waits on a real
+    NVMe-bound workload — the POSIX path is primary (frozen decision).
+
+> **Status 2026-11: DONE** — `include/arch/pipeline.h` + `src/io/pipeline.cpp`
+> (always built, plain POSIX; item 20 deferred). `writer::add_tree` now
+> collects walk jobs, submits regular files through the pipeline in walk
+> order and consumes them in walk order (`writer::impl::consume_pipelined_file`)
+> feeding the Phase 2 streaming pwrite/dedup/TOC path — output is
+> byte-identical to the serial path (`options.threads = 0` selects the serial
+> fallback; a determinism test proves equality). Memory is bounded by
+> `block_permits` with a per-file liveness cap; failed files are reaped so
+> the writer stays usable. 200 MiB / 200-file tree: 0.18 s serial → 0.04 s
+> pipelined (page cache). New tests: `test/test_pipeline.cpp` (8 cases,
+> incl. ASan/UBSan-clean); suites now **51/51 default, 57/57
+> `ARCH_WITH_URING=ON`**.
 
 ### Phase 4: Reader
 21. **Deserialization** — `pread` footer, validate self-check + signature

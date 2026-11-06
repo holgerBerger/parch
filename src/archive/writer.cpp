@@ -1,6 +1,7 @@
 #include "arch/archive.h"
 #include "arch/format.h"
 #include "arch/compressor.h"
+#include "arch/pipeline.h"
 #ifdef ARCH_WITH_URING
 #include "arch/io_uring_pool.h"
 #include "arch/prefetch.h"
@@ -199,6 +200,9 @@ struct writer::impl {
     std::unique_ptr<compress::compressor> comp;
     std::uint8_t section_compressor_id = format::COMPRESSOR_NONE;
 
+    // Phase 3 file-level I/O pipeline (lazily created by add_tree).
+    std::unique_ptr<io::pipeline> pipe;
+
     // ---- archive-wide state ----
     std::vector<format::toc_section_ref> toc_refs; // finalized sections
     std::uint64_t total_uncompressed = 0;
@@ -225,6 +229,13 @@ struct writer::impl {
                             std::uint64_t symlink_target_id = 0,
                             std::uint64_t link_target_id = 0,
                             std::uint64_t uncompressed_size_override = 0);
+
+    /// Lazily create the Phase 3 file-level I/O + compression pipeline.
+    io::pipeline* get_pipeline();
+
+    /// Drain one pipeline file in submit order: stream its blocks to disk
+    /// (with dedup), then build the file_entry from the terminal record.
+    void consume_pipelined_file(const std::string& rel, std::uint64_t seq);
 
     void ensure_section();
     void finalize_section();
@@ -452,6 +463,110 @@ void writer::impl::add_metadata_entry(const std::filesystem::path& name,
             blob.push_back('\0');
             entry.acl_id = add_blob(blob);
         }
+    }
+
+    total_uncompressed += entry.uncompressed_size;
+    entries.push_back(entry);
+}
+
+io::pipeline* writer::impl::get_pipeline() {
+    if (!pipe) {
+        // Pin the section codec (same contract as add_file_impl). "none"
+        // stores raw blocks: no codec instance, compressor id 0.
+        if (!comp && section_compressor_id == format::COMPRESSOR_NONE &&
+            opts.compressor != "none") {
+            comp = compress::make_compressor(opts.compressor, opts.compression_level);
+            section_compressor_id = comp->id();
+        }
+        io::pipeline::options po;
+        po.files_in_flight = static_cast<int>(std::max<std::size_t>(opts.pipeline_depth, 1));
+        po.compress_threads = std::max(1, opts.threads);
+        // block_permits / per_file_cap keep their defaults; the constructor
+        // scales the pool to the per-file liveness bound.
+        pipe = std::make_unique<io::pipeline>(
+            po, opts.compressor, opts.compression_level,
+            /*use_compression=*/ opts.compressor != "none", opts.dedup);
+    }
+    return pipe.get();
+}
+
+// Drain one submitted file in walk order: stream its blocks (dedup-checked)
+// straight to disk, then complete the file_entry from the terminal record.
+void writer::impl::consume_pipelined_file(const std::string& rel, std::uint64_t seq)
+{
+    format::file_entry entry{};
+    entry.path_id = add_string(rel);
+    entry.block_list_offset = blocks.size();
+
+    std::size_t i = 0;
+    io::pipeline_block pb;
+    while (pipe->next_block(seq, i, pb)) {
+        bool dup = false;
+        if (opts.dedup) {
+            auto hit = dedup_lookup.find(pb.content_id);
+            if (hit != dedup_lookup.end()) {
+                // Duplicate: self-describing copy of the owner's fields.
+                const auto& owner = blocks[dedup_index[hit->second].block_index];
+                format::block_entry be{};
+                be.offset            = owner.offset;
+                be.compressed_size   = owner.compressed_size;
+                be.uncompressed_size = pb.uncompressed_size;
+                be.content_id        = pb.content_id;
+                be.crc32c            = owner.crc32c;
+                be.compressor_id     = owner.compressor_id;
+                dedup_index[hit->second].ref_count++;
+                blocks.push_back(be);
+                dup = true;
+            }
+        }
+        if (!dup) {
+            format::block_entry be{};
+            be.offset = DATA_OFFSET + data_written; // section-relative
+            write_at(section_start + be.offset, pb.compressed.data(), pb.compressed.size());
+            data_written += pb.compressed.size();
+
+            be.compressed_size   = static_cast<std::uint32_t>(pb.compressed.size());
+            be.uncompressed_size = pb.uncompressed_size;
+            be.content_id        = pb.content_id;
+            be.crc32c            = pb.crc32c;
+            be.compressor_id     = pb.compressor_id;
+            blocks.push_back(be);
+
+            if (opts.dedup) {
+                dedup_lookup[pb.content_id] = dedup_index.size();
+                dedup_index.push_back(
+                    {pb.content_id, be.offset, blocks.size() - 1, 1});
+            }
+        }
+        pipe->release_block(seq);
+        pb = io::pipeline_block{};
+        i++;
+    }
+
+    auto fin = pipe->wait_file_done(seq);
+    if (fin.error) {
+        SPDLOG_ERROR("pipeline read failed for {}: {}",
+                     fin.path.c_str(), fin.error.message());
+        throw std::system_error(fin.error, "pipeline read failed: " + fin.path.string());
+    }
+
+    entry.mode = static_cast<std::uint16_t>(fin.st.st_mode);
+    entry.uid  = fin.st.st_uid;
+    entry.gid  = fin.st.st_gid;
+    entry.mtime_sec  = static_cast<std::uint64_t>(fin.st.st_mtim.tv_sec);
+    entry.mtime_nsec = static_cast<std::uint32_t>(fin.st.st_mtim.tv_nsec);
+    entry.atime_sec  = static_cast<std::uint64_t>(fin.st.st_atim.tv_sec);
+    entry.atime_nsec = static_cast<std::uint32_t>(fin.st.st_atim.tv_nsec);
+    entry.nlink      = fin.st.st_nlink;
+    entry.uncompressed_size = static_cast<std::uint64_t>(fin.st.st_size);
+    entry.checksum = fin.file_crc32c;
+    entry.block_count = blocks.size() - entry.block_list_offset;
+
+    // Xattr / ACL blobs live in the string table (xattr_id/acl_id = offset).
+    if (!fin.xattr_blob.empty()) entry.xattr_id = add_blob(fin.xattr_blob);
+    if (!fin.acl_blob.empty()) {
+        fin.acl_blob.push_back('\0'); // ACL text is NUL-terminated
+        entry.acl_id = add_blob(fin.acl_blob);
     }
 
     total_uncompressed += entry.uncompressed_size;
@@ -727,7 +842,19 @@ void writer::add_tree(const std::filesystem::path& root) {
     namespace fs = std::filesystem;
     // Deterministic depth-first walk (names sorted per directory). Archive
     // paths are relative to `root` (frozen decision); the root itself is not
-    // stored as an entry.
+    // stored as an entry. The walk only collects jobs; consumption happens in
+    // the exact same order afterwards, so output is scheduling-independent.
+    struct tree_item {
+        fs::path abs;
+        std::string rel;
+        struct stat st{};
+        std::string text;       // symlink target / hardlink owner rel-path
+        enum kind_t { kMeta, kSymlink, kHardlinkDup, kFile } kind = kMeta;
+        std::uint64_t seq = ~std::uint64_t{0};  // pipeline sequence (kFile)
+        bool done = false;                      // consumed (or reaped after error)
+    };
+    std::vector<tree_item> items;
+
     std::vector<std::pair<fs::path /*abs*/, std::string /*rel*/>> stack;
     std::vector<std::pair<std::string, fs::directory_entry>> kids;
 
@@ -751,51 +878,117 @@ void writer::add_tree(const std::filesystem::path& root) {
         auto [abs, rel] = stack.back();
         stack.pop_back();
 
-        struct stat st{};
-        if (::lstat(abs.c_str(), &st)) {
+        tree_item it;
+        it.abs = std::move(abs);
+        it.rel = std::move(rel);
+        if (::lstat(it.abs.c_str(), &it.st)) {
             int e2 = errno;
-            SPDLOG_ERROR("lstat failed for {}: {}", abs.c_str(), strerror(e2));
-            throw std::system_error(e2, std::generic_category(), "lstat failed: " + abs.string());
+            SPDLOG_ERROR("lstat failed for {}: {}", it.abs.c_str(), strerror(e2));
+            throw std::system_error(e2, std::generic_category(), "lstat failed: " + it.abs.string());
         }
 
-        if (S_ISDIR(st.st_mode)) {
-            d->add_metadata_entry(rel, abs, st);
-            walk_dir(abs, rel);
-        } else if (S_ISLNK(st.st_mode)) {
-            std::string target = fs::read_symlink(abs).string();
-            d->add_metadata_entry(rel, abs, st,
-                                  /*symlink_target_id=*/d->add_string(target),
-                                  /*link_target_id=*/0,
-                                  /*uncompressed_size_override=*/target.size());
-        } else if (S_ISREG(st.st_mode) && st.st_nlink > 1) {
+        if (S_ISDIR(it.st.st_mode)) {
+            it.kind = tree_item::kMeta;
+            walk_dir(it.abs, it.rel);
+        } else if (S_ISLNK(it.st.st_mode)) {
+            it.kind = tree_item::kSymlink;
+            it.text = fs::read_symlink(it.abs).string();
+        } else if (S_ISREG(it.st.st_mode) && it.st.st_nlink > 1) {
             // Hardlink: first path storing data owns the inode; duplicates
             // reference it via link_target_id (spec §File Entry).
-            auto key = std::make_pair(static_cast<std::uint64_t>(st.st_dev),
-                                      static_cast<std::uint64_t>(st.st_ino));
-            if (auto it = d->inode_paths.find(key); it != d->inode_paths.end()) {
-                d->add_metadata_entry(rel, abs, st, 0,
-                                      /*link_target_id=*/d->add_string(it->second),
-                                      /*override 0 → falls back to st_size (informational;
-                                        no block list — extract re-links to the owner)*/ 0);
+            auto key = std::make_pair(static_cast<std::uint64_t>(it.st.st_dev),
+                                      static_cast<std::uint64_t>(it.st.st_ino));
+            if (auto found = d->inode_paths.find(key); found != d->inode_paths.end()) {
+                it.kind = tree_item::kHardlinkDup;
+                it.text = found->second;
             } else {
-                d->inode_paths[key] = rel;
-                int fd = ::open(abs.c_str(), O_RDONLY | O_NOFOLLOW);
-                if (fd < 0) {
-                    int e2 = errno;
-                    throw std::system_error(e2, std::generic_category(), "open failed: " + abs.string());
-                }
-                d->add_file_impl(rel, abs, static_cast<std::uint64_t>(st.st_size), fd);
+                d->inode_paths[key] = it.rel;
+                it.kind = tree_item::kFile;
             }
-        } else if (S_ISREG(st.st_mode)) {
-            int fd = ::open(abs.c_str(), O_RDONLY | O_NOFOLLOW);
+        } else if (S_ISREG(it.st.st_mode)) {
+            it.kind = tree_item::kFile;
+        } else {
+            it.kind = tree_item::kMeta; // blk/chr/fifo/sock: metadata-only
+        }
+        items.push_back(std::move(it));
+    }
+
+    // ---- consumption, strictly in walk order ----
+    auto consume_meta = [&](tree_item& it) {
+        switch (it.kind) {
+        case tree_item::kSymlink:
+            d->add_metadata_entry(it.rel, it.abs, it.st,
+                                  /*symlink_target_id=*/d->add_string(it.text),
+                                  /*link_target_id=*/0,
+                                  /*uncompressed_size_override=*/it.text.size());
+            break;
+        case tree_item::kHardlinkDup:
+            d->add_metadata_entry(it.rel, it.abs, it.st, 0,
+                                  /*link_target_id=*/d->add_string(it.text),
+                                  /*override 0 → falls back to st_size (informational;
+                                    no block list — extract re-links to the owner)*/ 0);
+            break;
+        default:
+            d->add_metadata_entry(it.rel, it.abs, it.st);
+        }
+    };
+
+    if (d->opts.threads <= 0) {
+        // Serial fallback (also the reference for determinism tests).
+        for (auto& it : items) {
+            if (it.kind != tree_item::kFile) { consume_meta(it); continue; }
+            int fd = ::open(it.abs.c_str(), O_RDONLY | O_NOFOLLOW);
             if (fd < 0) {
                 int e2 = errno;
-                throw std::system_error(e2, std::generic_category(), "open failed: " + abs.string());
+                throw std::system_error(e2, std::generic_category(), "open failed: " + it.abs.string());
             }
-            d->add_file_impl(rel, abs, static_cast<std::uint64_t>(st.st_size), fd);
-        } else {
-            d->add_metadata_entry(rel, abs, st); // blk/chr/fifo/sock: metadata-only
+            d->add_file_impl(it.rel, it.abs,
+                             static_cast<std::uint64_t>(it.st.st_size), fd);
         }
+        return;
+    }
+
+    // Phase 3 pipeline: keep up to `depth` files in flight. Files are
+    // submitted in walk order and consumed in walk order; the window keeps
+    // I/O workers busy (network-FS latency hidden across files) while the
+    // writer streams blocks to disk in the exact serial-path order.
+    auto* pipe = d->get_pipeline();
+    const std::size_t depth = std::max<std::size_t>(d->opts.pipeline_depth, 1);
+    std::size_t next_consume = 0;
+
+    auto consume_one = [&](tree_item& it) {
+        if (it.kind == tree_item::kFile) d->consume_pipelined_file(it.rel, it.seq);
+        else consume_meta(it);
+        it.done = true;
+    };
+
+    auto reap_rest = [&] {
+        // Error path: retire every submitted-but-undrained file so the
+        // writer stays usable (in-flight slots and permits freed).
+        for (auto& it : items)
+            if (it.kind == tree_item::kFile && !it.done) {
+                try { pipe->wait_file_done(it.seq); } catch (...) {}
+                it.done = true;
+            }
+    };
+
+    try {
+        for (std::size_t i = 0; i < items.size(); ++i) {
+            auto& it = items[i];
+            if (it.kind != tree_item::kFile) continue;
+            // Free an in-flight slot if the window is full (submit-order drain;
+            // every item before i was already submitted, so this always ends).
+            while (pipe->in_flight() >= depth)
+                consume_one(items[next_consume++]);
+            it.seq = pipe->submit(it.abs,
+                                  static_cast<std::uint64_t>(it.st.st_size),
+                                  /*follow_symlinks=*/false);
+        }
+        while (next_consume < items.size())
+            consume_one(items[next_consume++]);
+    } catch (...) {
+        reap_rest();
+        throw;
     }
 }
 
