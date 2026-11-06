@@ -1,20 +1,20 @@
 #pragma once
 
+#include "arch/compressor.h"
 #include <vector>
 #include <string_view>
 #include <memory>
 
-namespace arch::compress {
-class compressor;
-}
+struct ZSTD_CCtx_s;
 
 namespace arch::compress {
 
 /// Zstandard compressor implementation.
-/// Configurable thread count (internal to zstd's dictionary/streaming mode).
+/// Runs single-threaded per block (nbWorkers=1); parallelism comes from the
+/// writer's block-compression pool (PLAN.md Phase 3), not from zstd itself.
 class zstd_impl : public compressor {
 public:
-    explicit zstd_impl(int threads = 0); // 0 = auto
+    explicit zstd_impl(int level = 3);
 
     std::uint8_t id() const override;
     std::string_view name() const override;
@@ -24,8 +24,8 @@ public:
     std::size_t mem_usage_hint() const override;
 
 private:
-    int m_threads;
-    std::unique_ptr<void, void (*)(void*)> m_cctx; // ZSTD_CCtx*
+    int m_level;
+    std::unique_ptr<ZSTD_CCtx_s, void (*)(ZSTD_CCtx_s*)> m_cctx;
 };
 
 } // namespace arch::compress

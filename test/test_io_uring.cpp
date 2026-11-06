@@ -17,7 +17,7 @@ TEST_CASE("io_uring_pool write then read", "[io_uring][pool]") {
     volatile bool read_done = false;
 
     pool.submit_write(tfd, hello.data(), hello.size(), 0, nullptr,
-                      [&write_done](int, void*, int res) {
+                      [&write_done, &hello](int, void*, int res) {
         REQUIRE(res == static_cast<int>(hello.size()));
         write_done = true;
     });
@@ -70,10 +70,15 @@ TEST_CASE("io_uring_pool multiple sequential writes", "[io_uring][pool]") {
     arch::io::io_uring_pool pool(256, 256, 2);
     std::atomic<int> written{0};
 
+    // Buffers must outstand the async writes: keep them alive until after
+    // drain_and_stop() instead of using a per-iteration temporary.
+    std::vector<std::string> datas;
     for (int i = 0; i < 8; ++i) {
-        std::string data = "chunk-" + std::to_string(i) + "-padding1234";
+        datas.push_back("chunk-" + std::to_string(i) + "-padding1234");
+    }
+    for (int i = 0; i < 8; ++i) {
         uint64_t off = static_cast<uint64_t>(i) * 1024;
-        pool.submit_write(tfd, data.data(), data.size(), off, nullptr,
+        pool.submit_write(tfd, datas[i].data(), datas[i].size(), off, nullptr,
                           [&written](int, void*, int res) {
             REQUIRE(res >= 0);
             written.fetch_add(1, std::memory_order_relaxed);

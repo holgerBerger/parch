@@ -1,6 +1,11 @@
 #include <catch2/catch_test_macros.hpp>
+#include "util/xattr.h"
 #include <spdlog/spdlog.h>
+#include <filesystem>
+#include <fstream>
+#include <sys/xattr.h>
 #include <vector>
+#include <cstdint>
 #include <random>
 
 TEST_CASE("crc32c of known data block", "[cutil][xattr]") {

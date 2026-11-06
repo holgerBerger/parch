@@ -1,6 +1,5 @@
 #include "arch/prefetch.h"
 #include <algorithm>
-#include <chrono>
 
 namespace arch::io {
 
@@ -17,9 +16,9 @@ prefetcher::~prefetcher() = default;
 
 void prefetcher::start(int fd, std::uint64_t file_sz)
 {
+    std::lock_guard lk(m_mtx);
     m_fd = fd;
     m_file_size = file_sz;
-    m_next_offset = 0;
     m_next_delivery = 0;
     m_eof = false;
     m_chunks.clear();
@@ -29,8 +28,9 @@ void prefetcher::start(int fd, std::uint64_t file_sz)
 
 void prefetcher::submit_prefetch_batch()
 {
-    // Ensure we have enough chunks to cover the prefetch window.
-    while (true) {
+    // Ensure we have enough chunks in flight to cover the prefetch window.
+    // Caller holds m_mtx.
+    while (!m_eof) {
         // Find the highest offset we already have a chunk for.
         std::uint64_t highest = 0;
         for (auto& c : m_chunks) {
@@ -38,38 +38,38 @@ void prefetcher::submit_prefetch_batch()
                 highest = c->offset + c->size;
         }
 
-        if (highest >= m_file_size) break;
-
-        // How far ahead of the delivery pointer are we?
-        std::uint64_t ahead = highest - m_next_delivery;
-        if (ahead >= m_window_size && !m_eof) break;
-
-        // Allocate a new chunk.
-        auto* chunk = new chunk();
-        chunk->offset = highest;
-        chunk->size = std::min(m_chunk_size, m_file_size - highest);
-        if (chunk->size == 0) {
+        if (highest >= m_file_size) {
+            // Everything has been submitted — no more chunks will appear.
             m_eof = true;
             m_cv.notify_all();
-            delete chunk;
             break;
         }
-        chunk->data.resize(chunk->size);
 
-        auto* ptr = chunk.get(); // raw ptr for lambda capture
+        // How far ahead of the delivery pointer are we?
+        if (highest - m_next_delivery >= m_window_size) break;
 
-        int ret = m_pool.submit_read(m_fd, chunk->data.data(),
-                                     static_cast<unsigned>(chunk->size),
-                                     chunk->offset, ptr,
-                                     [this, ptr](int, void*, int res) {
-            if (res < 0) {
-                // Read error — mark chunk as done with zeroed data.
-            }
-            ptr->ready.store(true, std::memory_order_release);
+        // Allocate a new chunk.
+        auto c = std::make_shared<chunk>();
+        c->offset = highest;
+        c->size = std::min(m_chunk_size, m_file_size - highest);
+        c->data.resize(c->size);
+
+        // The callback's shared_ptr copy keeps the chunk (and its kernel read
+        // buffer) alive until after the ready store below; the shared_ptr is
+        // destroyed by the pool worker when it discards the callback.
+        m_pool.submit_read(m_fd, c->data.data(),
+                           static_cast<unsigned>(c->size), c->offset, c.get(),
+                           [this, c](int, void*, int res) {
+            (void)res; // short read / error: undelivered bytes stay zeroed
+            // Take m_mtx around store+notify: otherwise a notify can land
+            // between the pop_ready_chunk predicate check and the actual
+            // sleep (lost wakeup ⇒ permanent block).
+            std::lock_guard lk(m_mtx);
+            c->ready = true;
             m_cv.notify_all();
         });
 
-        m_chunks.push_back(std::unique_ptr<chunk>(chunk)); // transfer ownership
+        m_chunks.push_back(std::move(c));
     }
 }
 
@@ -77,37 +77,40 @@ std::optional<std::pair<std::uint64_t, std::vector<std::uint8_t>>>
 prefetcher::pop_ready_chunk()
 {
     std::unique_lock lk(m_mtx);
+
+    // Wait for the *next in-order* chunk to be ready, or for delivery to be
+    // complete (eof reached and everything already handed out).
     m_cv.wait(lk, [this] {
-        if (m_eof) return true;
-        // Find the next ready chunk in order.
-        for (auto& c : m_chunks) {
-            if (c->offset == m_next_delivery && c->ready.load(std::memory_order_acquire))
-                return true;
-        }
+        if (m_next_delivery >= m_file_size) return true; // done (also covers empty files)
+        for (auto& c : m_chunks)
+            if (c->offset == m_next_delivery && c->ready) return true;
         return false;
     });
 
-    if (m_eof && m_next_delivery >= m_file_size) {
+    if (m_next_delivery >= m_file_size) {
+        if (!m_eof) {
+            // All data consumed but submissions may still be pending —
+            // (re)check so eof is set for is_done().
+            submit_prefetch_batch();
+        }
         return std::nullopt;
     }
 
-    // Find and extract the next chunk.
+    // Extract the next chunk (guaranteed ready by the predicate).
     for (auto it = m_chunks.begin(); it != m_chunks.end(); ++it) {
-        if ((*it)->offset == m_next_delivery) {
+        if ((*it)->offset == m_next_delivery && (*it)->ready) {
             auto data = std::move((*it)->data);
             auto off  = (*it)->offset;
             m_next_delivery += (*it)->size;
-            delete *it;
-            m_chunks.erase(it);
+            m_chunks.erase(it); // callback may still hold its own reference
 
-            // Trigger more prefetch.
-            submit_prefetch_batch();
+            submit_prefetch_batch(); // fill the window again
 
             return std::make_pair(off, std::move(data));
         }
     }
 
-    return std::nullopt;
+    return std::nullopt; // unreachable unless a read was skipped
 }
 
 bool prefetcher::is_done() const

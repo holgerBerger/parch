@@ -5,27 +5,26 @@
 #include <vector>
 
 TEST_CASE("CRC32C of empty data is 0", "[crc32c]") {
-    crc32c::Crc32c c;
-    REQUIRE(static_cast<uint32_t>(c.Value()) == 0);
+    REQUIRE(crc32c::Extend(0, nullptr, 0) == 0);
 }
 
 TEST_CASE("CRC32C of known data", "[crc32c]") {
-    crc32c::Crc32c c;
-    c.Update(crc32c::StringView("Hello, CRC32C!", 14));
-    // Castagnoli CRC32C of "Hello, CRC32C!" is 0x87413555.
-    REQUIRE(c.Value() == 0x87413555u);
+    // Standard Castagnoli check value: CRC32C("123456789") == 0xE3069283.
+    const char* d = "123456789";
+    auto c = crc32c::Crc32c(reinterpret_cast<const std::uint8_t*>(d), 9);
+    REQUIRE(c == 0xE3069283u);
 }
 
 TEST_CASE("CRC32C incremental update", "[crc32c]") {
-    crc32c::Crc32c c1;
-    c1.Update(crc32c::StringView("Hello", 5));
-    c1.Update(crc32c::StringView(", Wor", 5));
-    c1.Update(crc32c::StringView("ld!", 3));
+    std::uint32_t c1 = 0;
+    c1 = crc32c::Extend(c1, reinterpret_cast<const std::uint8_t*>("Hello"), 5);
+    c1 = crc32c::Extend(c1, reinterpret_cast<const std::uint8_t*>(", Wor"), 5);
+    c1 = crc32c::Extend(c1, reinterpret_cast<const std::uint8_t*>("ld!"), 3);
 
-    crc32c::Crc32c c2;
-    c2.Update(crc32c::StringView("Hello, World!", 13));
+    std::uint32_t c2 = 0;
+    c2 = crc32c::Extend(c2, reinterpret_cast<const std::uint8_t*>("Hello, World!"), 13);
 
-    REQUIRE(c1.Value() == c2.Value());
+    REQUIRE(c1 == c2);
 }
 
 TEST_CASE("XXH3-64 deterministic", "[xxhash]") {

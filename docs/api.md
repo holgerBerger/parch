@@ -1,9 +1,11 @@
 # Archiver API Reference
 
+Format version **0.2** (design freeze 2026-11).
+
 The archiver library exposes three layers:
 
 1. **Public API** — `arch::writer` and `arch::reader` (`include/arch/archive.h`)
-2. **Format types** — on-disk structs and constants (`include/arch/format.h`)
+2. **Format types** — on-disk layout constants and in-memory structs (`include/arch/format.h`)
 3. **Internal API** — low-level I/O, compression, utilities (not public; may change)
 
 ---
@@ -16,69 +18,106 @@ The archiver library exposes three layers:
 
 ```cpp
 struct options {
-    std::string compressor      = "zstd";  // compressor name (registered via factory)
-    int         threads         = 4;       // parallel compression threads
-    bool        dedup           = false;   // enable content-aware deduplication
-    std::size_t prefetch_window = 16;      // small-file prefetch batch count
+    std::string compressor      = "zstd"; // compressor name (registered via factory)
+    int         compression_level = 3;    // codec level; pinned into the TOC section header
+    int         threads           = 4;    // block-compression pool size
+    std::size_t pipeline_depth    = 32;   // files in flight in the stat/open/read pipeline
+    bool        dedup             = false;// enable within-section content dedup
+    bool        durable           = true; // fsync ordering on finalize/append
 };
 ```
 
-- `compressor` — name string looked up in the compressor factory. Default is `"zstd"`.
-  Throws `std::runtime_error` at build time if the name is unknown.
-- `threads` — passed to the compressor (e.g. `ZSTD_c_nbThreads` for zstd). `0` means
-  auto-detect.
-- `dedup` — when true, each uncompressed block is XXH3-64 hashed before compression.
-  Blocks with identical content share physical storage. Adds ~1 × XXH3 pass + hash-table
-  overhead. Default `false`.
-- `prefetch_window` — for small files (< 16 MiB heuristic), the number of blocks to
-  keep in flight via io_uring read-ahead.
+- `compressor` — name looked up in the compressor factory. Throws
+  `std::runtime_error` at construction if unknown.
+- `compression_level` — passed to the compressor. Recorded in every TOC section
+  header (format 0.2) together with the codec ID, upholding the determinism
+  contract: *same input + same codec + same level ⇒ byte-identical output*.
+- `threads` — sizes the **block-compression pool**: workers compress ready
+  blocks from *all* in-flight files concurrently. This is the single
+  parallelism knob; codecs run single-threaded internally (zstd is pinned to
+  `ZSTD_c_nbWorkers=1`). Replaces the 0.1 semantics of "threads passed to the
+  compressor".
+- `pipeline_depth` — how many files the I/O pipeline keeps in flight
+  (stat → open → read across files). This — not within-file readahead — is the
+  network-FS latency mechanism. Replaces the old `prefetch_window`.
+  (Pipeline implementation: PLAN.md Phase 3; until then all I/O is serial.)
+- `dedup` — when true, each uncompressed block is **XXH3-128** hashed before
+  compression; duplicates share physical storage **within the section**.
+  Requires a codec honouring the determinism contract. Default `false`.
+- `durable` — when true, `finalize()`/`append()` enforce the write order
+  data → fsync → TOC → fsync → TOC table + footer → fsync. Setting false
+  trades crash-durability for speed (single fsync at the end).
 
 ### `writer::writer(path, options)`
 
-Opens (or creates) the archive file at `path` in write-truncate mode. Writes the 16-byte
-archive header magic (`ARCH\x01\x00`).
+Opens (or creates) the archive file at `path` in write-truncate mode. Writes
+the 16-byte archive header magic (`ARCH\x01\x00`).
 
 **Throws** `std::system_error` if `open()` fails.
 
-### `~writer::~writer()`
+### `writer::~writer()`
 
-Closes the file descriptor if still open. Does **not** auto-finalize — the archive is
-invalid if `finalize()` was not called.
+Closes the file descriptor if still open. Does **not** auto-finalize — the
+archive is invalid if `finalize()` was not called.
 
 ### `void add_file(path)`
 
 Archives a filesystem object at `path`. Automatically reads:
-- `fstat()` → mode, uid, gid, mtime, atime, nlink
+- `fstat()`/`statx()` → mode, uid, gid, mtime, atime, nlink
 - `listxattr()` / `getxattr()` → extended attributes
-- ACL text (via `getfacl`, pending implementation)
+- ACL text (`getfacl` form, pending implementation)
 
-For regular files, data is read in 4 MiB blocks, each compressed independently. Large
-file reads use `pread()` directly. Small files (< 16 MiB) trigger the prefetcher path.
+Storage rules:
+- **Regular files** are read in 4 MiB blocks, each compressed independently and
+  **streamed to disk as produced** (only TOC metadata stays in RAM — writer
+  memory is bounded regardless of archive size; Phase 2).
+- **Symlinks** store their target in `symlink_target_id` (string table). The
+  0.1 code read the target and discarded it — a bug fixed by the format.
+- **Hardlinks**: repeated `add_file()` calls on distinct paths sharing an inode
+  are only detected by `add_tree()` (which keeps an inode→path map). A
+  standalone `add_file()` archives the data again.
+- **Paths** are stored as given; callers should pass names relative to a
+  logical root (see `add_tree`). Names with `..` elements are rejected at
+  extraction.
 
 **Throws** `std::system_error` on any filesystem error.
 
 ### `void add_file(path, data)`
 
-Archives in-memory data. Path is stored verbatim as the entry name. Data is split into
-4 MiB blocks, compressed, and CRC32C checksummed.
+Archives in-memory data. Path is stored verbatim as the entry name. Data is
+split into 4 MiB blocks, compressed, and CRC32C checksummed.
+
+### `void add_tree(root)` *(planned — Phase 2)*
+
+Recursively archives the directory tree at `root`:
+- Entry names are stored **relative to `root`** (no leading `/`, no `..`).
+- Directories become metadata entries; devices/fifos/sockets as in `add_file`.
+- Hardlink duplicates share one data set via `link_target_id` (inode→path map).
+- The walk feeds the I/O pipeline: `pipeline_depth` files are stat/ed/opened/
+  read concurrently — this is why recursion is a first-class operation rather
+  than a caller-side loop (a serial loop re-creates the per-file network
+  round-trip cost the archiver exists to hide).
+
+**Throws** `std::system_error` on any filesystem error.
 
 ### `void finalize()`
 
-Flushes all in-memory state to disk:
-1. Compressed data region
-2. Block entry array
-3. File entry array
-4. String table (null-terminated paths)
-5. TOC section header (with CRC32C)
-6. Footer (256 bytes, with signature CRC)
+Flushes all in-memory state to disk, per the format spec:
+1. Append `file_entry[]`, `block_entry[]`, string table, dedup index
+   (field-by-field big-endian — structs are never `memcpy`'d)
+2. Patch the `toc_header` at the section start (sizes + metadata CRC32C)
+3. Append the TOC table
+4. Write the 256-byte footer at EOF−256 (self-check + signature CRC)
 
-Calls `fsync()` before closing the file descriptor.
+With `durable = true` the step order is data → fsync → TOC → fsync → TOC
+table + footer → fsync, then the fd is closed.
 
 ### `void append(path)`
 
-Opens an **existing** finalized archive, reads and validates the footer, appends a new
-TOC section at EOF containing newly added files, and rewrites the footer. Not yet
-implemented.
+Opens an **existing** finalized archive, reads and validates the footer,
+appends a new **self-contained** TOC section at the old footer position, and
+rewrites TOC table + footer in the durability order above. Dedup does not
+cross sections. Not yet implemented (PLAN.md Phase 6).
 
 ---
 
@@ -88,11 +127,16 @@ implemented.
 
 ### `reader::reader(path)`
 
-Opens the archive in read-only mode. Validates the footer magic, reads the TOC table,
-and parses all TOC sections into an in-memory entry list.
+Opens the archive read-only. Validates the footer (self-check + signature
+CRC), reads the TOC table, and parses **section metadata only** (headers,
+entry arrays, string tables) into an in-memory listing — data blocks are never
+read here, because the TOC CRCs cover metadata only (format 0.2 decision).
+
+Sections whose data extends past EOF are treated as a clean truncation point,
+not corruption (crash-recovery rule).
 
 **Throws** `std::system_error` if the file cannot be opened.
-**Throws** `std::runtime_error` if footer magic/Checksum is invalid (future).
+**Throws** `std::runtime_error` if the footer is absent/invalid.
 
 ### `std::vector<listing_entry> list() const`
 
@@ -100,33 +144,39 @@ Returns metadata for every entry across all TOC sections. Fields:
 
 | Field | Type | Notes |
 |---|---|---|
-| `path` | `std::filesystem::path` | Archive member name |
+| `path` | `std::filesystem::path` | Relative member name |
 | `type` | `format::file_type` | `regular`, `symlink`, `directory`, `blkdev`, `chrdev` |
 | `size` | `std::uint64_t` | Uncompressed size |
-| `mode` | `std::uint16_t` | POSIX mode bits |
+| `mode` | `std::uint16_t` | Permission + type bits |
 | `uid` | `std::uint32_t` | Owner UID |
 | `gid` | `std::uint32_t` | Owner GID |
 | `mtime` | `std::uint64_t` | Modification time (seconds) |
+| `link_target` | `std::string` | Symlink target or hardlink canonical path; empty if neither |
 
 ### `void extract(arc_path, dest)`
 
-Extracts a single entry identified by its archive path to `dest`. Verifies block-level
-CRC32C before decompression, entry-level CRC32C after. Restores mode, times, xattrs,
-and ACLs.
+Extracts a single entry identified by its archive path to `dest`. Verifies
+block-level CRC32C before decompression and entry-level CRC32C after.
+Restores mode, times, xattrs, and ACLs; re-creates symlink targets and
+hardlinks (`link()` against the already-extracted canonical path).
 
-Blocks the calling thread until the entry is fully extracted.
+Names that are absolute or contain `..` path elements are **rejected**
+(zip-slip guard) — the whole entry fails with `std::runtime_error`.
+
+Blocks the calling thread until the entry is fully extracted. (A parallel
+extraction pipeline mirroring the write side: PLAN.md Phase 4.)
 
 ### `void extract_all(dest)`
 
-Iterates `list()` in order. Creates directory entries first, then extracts regular files.
-Preserves the archive directory structure rooted at `dest`.
+Iterates `list()` in order. Creates directory entries first, then regular
+files, symlinks, and hardlink duplicates last (after their canonical target
+exists). Preserves the archive structure rooted at `dest`.
 
 ### `get_xattrs(arc_path)`
 
 Returns xattr key/value pairs for an entry.
 
 ```cpp
-// Returns: { {"user.selinux", { 0x73, 0x79, 0x73, 0x74, 0x65, 0x6d, 0x75, 0x00 }}, ... }
 std::vector<std::pair<std::string, std::vector<std::uint8_t>>> get_xattrs(path);
 ```
 
@@ -158,9 +208,17 @@ public:
 
 Each call to `compress()` receives exactly one block (≤ 4 MiB). Returns a
 `compressed_block` containing the compressed data, CRC32C, and codec ID.
+Codecs are constructed with a level and are always invoked single-threaded —
+parallelism comes from the writer's block-compression pool, not from the codec.
 
-`decompress()` receives the raw compressed bytes and the expected uncompressed size.
-Returns an empty `vector` on failure (corrupted data, size mismatch).
+**Determinism contract:** for any input `X`, `compress(X)` must return
+byte-identical output on every call and every conforming implementation build,
+given the same codec ID and level. Required for dedup verification (a duplicate
+block's `crc32c` is the owner's). `zstd_impl` satisfies this (no adaptive
+strategy across blocks); custom codecs must opt in or forbid `dedup`.
+
+`decompress()` receives the raw compressed bytes and the expected uncompressed
+size. Returns an empty `vector` on failure (corrupted data, size mismatch).
 
 ### `compressed_block`
 
@@ -175,17 +233,22 @@ struct compressed_block {
 ### Factory
 
 ```cpp
-std::unique_ptr<compressor> make_compressor(std::string_view name);
+std::unique_ptr<compressor> make_compressor(std::string_view name, int level);
 void register_compressor(std::string_view name,
-                         std::function<std::unique_ptr<compressor>()> factory);
+                         std::function<std::unique_ptr<compressor>(int level)> factory);
 ```
 
-`make_compressor("zstd")` → returns zstd. Throws if unknown.
+`make_compressor("zstd", 3)` → zstd at level 3. Throws if unknown.
+(The 0.1 signature took no level; the level is now explicit and recorded in the
+TOC header.) Factories are invoked while the registry mutex is held — they must
+not re-enter `register_compressor`/`make_compressor`.
 
 ### Registering a new compressor
 
 ```cpp
 class lz4_impl : public compressor {
+public:
+    explicit lz4_impl(int level);
     std::uint8_t id() const override { return 0x10; }
     std::string_view name() const override { return "lz4"; }
     // ...
@@ -194,15 +257,37 @@ REGISTER_COMPRESSOR("lz4", lz4_impl);
 ```
 
 The static initializer calls `register_compressor` once. After that,
-`make_compressor("lz4")` works.
+`make_compressor("lz4", level)` works.
 
 ---
 
 ## 4. I/O layer (internal, documented for reference)
 
-**Not public API — subject to change.** Low-level `io_uring` wrapper and prefetcher.
+**Not public API — subject to change.**
 
-### `io::io_uring_pool`
+### Primary path: `arch::io::pipeline` (planned — Phase 3)
+
+```cpp
+// Sketch; final names land in Phase 3.
+class file_pipeline {
+public:
+    struct ready_block {
+        std::uint64_t file_index;   // which file in the list
+        std::uint64_t offset;       // within the file
+        std::vector<std::uint8_t> data;
+    };
+    file_pipeline(std::size_t depth /* pipeline_depth */);
+    void start(std::span<const std::filesystem::path> files);
+    std::optional<ready_block> pop();       // blocks; nullopt when drained/failed
+    std::exception_ptr error() const;       // first worker failure, propagated
+};
+```
+
+Worker threads run `statx` → `openat` → `pread` over **many files at once**;
+this is the portable POSIX implementation of the network-FS fast path and the
+*default and only* I/O mechanism in a standard build.
+
+### Optional backend: `io::io_uring_pool` (`ARCH_WITH_URING=ON`)
 
 ```cpp
 using io_callback = std::function<void(int fd, void*, int res)>;
@@ -228,30 +313,19 @@ public:
 
 - Callback parameters: `fd` (unused, `-1`), `ud` (pointer to submission tag),
   `res` (bytes transferred, or negative errno on failure).
-- Not thread-safe for concurrent submissions from multiple threads; the caller must
-  serialize `submit_*` calls or provide its own locking.
-- `drain_and_stop()` blocks until all pending CQEs are processed, then terminates
-  worker threads.
+- Not thread-safe for concurrent submissions from multiple threads; the caller
+  must serialize `submit_*` calls or provide its own locking.
+- `drain_and_stop()` blocks until all pending CQEs are processed, then
+  terminates worker threads.
+- Intended end state: one implementation of the pipeline interface, chosen at
+  build time, for local-NVMe workloads. Until then it is legacy/experimental.
 
-### `io::prefetcher`
+### Optional backend: `io::prefetcher` (`ARCH_WITH_URING=ON`)
 
-```cpp
-class prefetcher {
-public:
-    prefetcher(io_uring_pool& pool,
-               size_t window_size = 1 * 1024 * 1024,
-               size_t chunk_size  = 64 * 1024);
-    void start(int fd, std::uint64_t file_size);
-    std::optional<std::pair<std::uint64_t, std::vector<std::uint8_t>>>
-    pop_ready_chunk();
-    bool is_done() const;
-};
-```
-
-- `start(fd, size)` — begin async reads from `fd` at offset 0.
-- `pop_ready_chunk()` — blocking pull of the next chunk in offset order. Returns
-  `{offset, data}`. Returns `std::nullopt` when EOF is reached and all chunks consumed.
-- `is_done()` — true when the file has been fully prefetched and all chunks delivered.
+Within-one-file readahead on `io_uring_pool` (window 1 MiB, 64 KiB chunks,
+ordered delivery via `pop_ready_chunk()`). Kept compiling, but superseded
+conceptually by the file-level pipeline — the archiver no longer treats
+in-file readahead as the latency mechanism.
 
 ---
 
@@ -259,8 +333,8 @@ public:
 
 ### `util::read_xattrs(path, out)`
 
-Reads POSIX extended attributes from `path`, appends them as a binary blob to `out`,
-returns the blob offset. Returns `0` if no xattrs.
+Reads POSIX extended attributes from `path`, appends them as a binary blob to
+`out`, returns the blob offset. Returns `0` if no xattrs.
 
 ### `util::write_xattrs(path, blob)`
 
@@ -278,19 +352,35 @@ POSIX.1e ACL getfacl/setfacl wrapper. Pending implementation.
 
 | Constant | Value | Units |
 |---|---|---|
-| `format::BLOCK_SIZE` | 4 MiB | bytes |
+| `format::ARCH_BLOCK_SIZE` | 4 MiB | bytes |
 | `format::COMPRESSOR_NONE` | `0x00` | byte |
 | `format::COMPRESSOR_ZSTD` | `0x01` | byte |
 
-On-disk structs are **always big-endian**. The helpers `htobe*/betoh*` in `format.h`
-handle conversion. Struct sizes are `static_assert`-verified:
+`ARCH_BLOCK_SIZE` replaces the old name `BLOCK_SIZE`, which collided with the
+`BLOCK_SIZE` macro from `sys/mount.h`.
 
-| Struct | Size |
+On-disk layout is **canonical field tables in `docs/format.md`**, always
+big-endian, never struct-backed `memcpy`. In-memory sizes of the helper structs
+are asserted, but the authoritative record sizes are:
+
+| Struct | On-disk size |
 |---|---|
-| `block_entry` | 32 bytes |
-| `footer` | 256 bytes |
-| `file_entry` | 148 bytes (variable depending on compiler padding) |
-| `dedup_entry` | 24 bytes |
+| archive header | 16 bytes |
+| footer | 256 bytes |
+| `toc_section_ref` | 24 bytes |
+| `toc_header` | 128 bytes |
+| `file_entry` | 128 bytes (fixed — includes `symlink_target_id`, `link_target_id`) |
+| `block_entry` | 48 bytes (16-byte XXH3-128 `content_id`) |
+| `dedup_entry` | 32 bytes (16-byte `content_hash`) |
+
+> `format.h` and the size tests are ported to the v0.2 layouts (PLAN.md
+> Phase 1 done): `digest128` = 16-byte `content_id`/`content_hash`, 128 B
+> `file_entry`, 128 B `toc_header` with codec + level + `metadata_crc`,
+> canonical `*_SIZE` constants with `static_assert` guards. Field-by-field
+> **serialization** lands with Phase 2.
+
+The helpers `htobe*_safe`/`betoh*_safe` in `format.h` dispatch on
+`__BYTE_ORDER__` — byte-swap on little-endian hosts, identity on big-endian.
 
 ---
 
@@ -301,14 +391,15 @@ handle conversion. Struct sizes are `static_assert`-verified:
 ```cpp
 #include <arch/archive.h>
 
-auto opts = arch::writer::options{};
-opts.dedup   = true;
-opts.threads = 4;
+arch::writer::options opts{};
+opts.dedup            = true;
+opts.threads          = 4;
+opts.pipeline_depth   = 64;   // many-small-files over NFS: raise this
+opts.compression_level = 5;
 
 arch::writer w("backup.arc", opts);
-w.add_file("/var/log/syslog");
-w.add_file("/etc/nginx/nginx.conf");
-w.add_file("data.txt", std::string_view("Hello, World!"));
+w.add_tree("/srv/data");                          // relative names under "data/"
+w.add_file("notes.txt", std::string_view("Hello, World!")); // in-memory entry
 w.finalize();
 ```
 
@@ -316,7 +407,7 @@ w.finalize();
 
 ```cpp
 arch::reader r("backup.arc");
-for (auto& e : r.list()) {
+for (auto& e : r.list()) {          // metadata only — fast even on NFS
     std::cout << e.path << "  " << e.size << "  " << std::oct << e.mode << "\n";
 }
 ```
@@ -325,7 +416,8 @@ for (auto& e : r.list()) {
 
 ```cpp
 arch::reader r("backup.arc");
-r.extract_all("/tmp/restore");
+r.extract_all("/tmp/restore");      // symlinks + hardlinks re-created,
+                                    // zip-slip names rejected
 ```
 
 ### Add a custom compressor
@@ -333,14 +425,16 @@ r.extract_all("/tmp/restore");
 ```cpp
 // In your .cpp:
 class noop_impl : public arch::compress::compressor {
-    std::uint8_t id() const override { return 0x10; }
+public:
+    explicit noop_impl(int /*level*/) {}
+    std::uint8_t id() const override { return 0x11; }
     std::string_view name() const override { return "none"; }
 
     arch::compress::compressed_block compress(std::span<const std::uint8_t> input) override {
         arch::compress::compressed_block b;
         b.data.assign(input.begin(), input.end());
-        b.crc32c = crc32c::Crc32c(input.data(), input.size());
-        b.compressor_id = 0x10;
+        b.crc32c = crc32c::Value(reinterpret_cast<const char*>(input.data()), input.size());
+        b.compressor_id = 0x11;
         return b;
     }
 
@@ -352,3 +446,6 @@ class noop_impl : public arch::compress::compressor {
 };
 REGISTER_COMPRESSOR("none", noop_impl);
 ```
+
+(`crc32c::Value` is the real google/crc32c entry point — the 0.1 doc used a
+non-existent `crc32c::Crc32c`.)

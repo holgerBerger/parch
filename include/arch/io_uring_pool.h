@@ -1,13 +1,16 @@
 #pragma once
 
 #include <linux/io_uring.h>
-#include <uring.h>
+#include <liburing.h>
 #include <vector>
+#include <thread>
 #include <functional>
 #include <optional>
 #include <atomic>
+#include <cstdint>
 #include <mutex>
 #include <condition_variable>
+#include <unordered_map>
 
 namespace arch::io {
 
@@ -64,18 +67,30 @@ public:
 
 private:
     void worker_loop(unsigned id);
+    std::uint64_t next_tag() {
+        return m_next_tag.fetch_add(1, std::memory_order_relaxed);
+    }
 
     ::io_uring m_ring;
     unsigned   m_workers;
     std::vector<std::thread> m_threads;
     std::atomic<bool> m_stopping{false};
 
-    // Callback registry — protected by m_mtx during submission,
-    // read-only during CQE drain (each callback is consumed once).
+    // Callback registry — protected by m_mtx during submission and drain
+    // (each callback is consumed exactly once).
     std::mutex m_mtx;
-    // Map user_data pointer → callback (cleared on completion).
-    std::vector<std::pair<uint64_t, io_callback>> m_callbacks;
+    // Map tag → callback (erased on completion).
+    std::unordered_map<uint64_t, io_callback> m_callbacks;
     std::atomic<uint64_t> m_next_tag{0}; // unique tag per submission
+    std::atomic<uint64_t> m_pending{0};  // submitted-but-not-yet-dispatched ops
+
+    // liburing CQE consumption is NOT thread-safe: concurrent
+    // io_uring_wait_cqe()/io_uring_cqe_seen() calls race on the shared
+    // completion head and can hand the same entry to two workers (⇒ callback
+    // runs twice) or skip one (⇒ the waiting op never completes). Workers
+    // reap completions under this lock and dispatch callbacks outside it.
+    std::mutex m_cq_mtx;
+    std::condition_variable m_drain_cv; // notified when m_pending hits 0
 };
 
 } // namespace arch::io

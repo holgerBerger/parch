@@ -39,20 +39,22 @@ public:
     virtual std::size_t mem_usage_hint() const { return 0; }
 };
 
-/// Factory: build a compressor by name string.
-std::unique_ptr<compressor> make_compressor(std::string_view name);
+/// Factory: build a compressor by name string at the given level.
+/// Throws std::runtime_error for unknown names.
+std::unique_ptr<compressor> make_compressor(std::string_view name, int level);
 
 /// Register a compressor class. Call once at program init.
 /// Usage: REGISTER_COMPRESSOR("zstd", compress::zstd_impl);
 #define REGISTER_COMPRESSOR(name, T)                                                    \
     namespace {                                                                         \
         struct __reg_##T {                                                              \
-            __reg_##T() { compress::register_compressor(name, [](){ return std::make_unique<T>(); }); } \
+            __reg_##T() { compress::register_compressor(                                \
+                name, [](int level){ return std::make_unique<T>(level); }); }           \
         };                                                                              \
         __reg_##T __inst_##T;                                                           \
     }
 
 void register_compressor(std::string_view name,
-                         std::function<std::unique_ptr<compressor>()> factory);
+                         std::function<std::unique_ptr<compressor>(int level)> factory);
 
 } // namespace arch::compress

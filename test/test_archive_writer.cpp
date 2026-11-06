@@ -70,8 +70,10 @@ TEST_CASE("writer options default values", "[writer]") {
     arch::writer::options opts;
     REQUIRE(opts.compressor == "zstd");
     REQUIRE(opts.threads > 0);
+    REQUIRE(opts.compression_level > 0);
     REQUIRE(opts.dedup == false);
-    REQUIRE(opts.prefetch_window > 0);
+    REQUIRE(opts.pipeline_depth > 0);
+    REQUIRE(opts.durable == true);
 }
 
 TEST_CASE("writer throws on invalid path", "[writer]") {

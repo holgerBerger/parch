@@ -3,7 +3,7 @@
 #include "arch/io_uring_pool.h"
 #include "arch/format.h"
 #include <vector>
-#include <queue>
+#include <memory>
 #include <filesystem>
 
 namespace arch::io {
@@ -44,14 +44,20 @@ public:
     bool is_done() const;
 
 private:
+    // Ownership: the io callback keeps a shared_ptr alive until *after* the
+    // kernel write and the ready-store are done, while pop_ready_chunk only
+    // ever drops the prefetcher's own reference — so a delivered (or even
+    // re-submitted) chunk can never be freed underneath the callback
+    // (use-after-free otherwise), and the read buffer cannot be recycled
+    // while the kernel still owns it.
     struct chunk {
-        std::uint64_t offset;
-        std::size_t   size;
+        std::uint64_t offset = 0;
+        std::size_t   size = 0;
         std::vector<std::uint8_t> data;
-        std::atomic<bool> ready{false};
+        bool ready = false; // guarded by prefetcher::m_mtx
     };
 
-    void submit_prefetch_batch();
+    void submit_prefetch_batch(); // caller must hold m_mtx
 
     io::io_uring_pool& m_pool;
     std::size_t m_window_size;
@@ -59,13 +65,12 @@ private:
 
     int m_fd{-1};
     std::uint64_t m_file_size{0};
-    std::uint64_t m_next_offset{0};   // where to read next
     std::uint64_t m_next_delivery{0}; // which offset to deliver next
 
-    std::vector<std::unique_ptr<chunk>> m_chunks;
+    std::vector<std::shared_ptr<chunk>> m_chunks; // outstanding (not yet delivered)
     std::mutex m_mtx;
     std::condition_variable m_cv;
-    bool m_eof{false};
+    bool m_eof{false}; // all reads submitted — delivery still checks m_next_delivery
 };
 
 } // namespace arch::io

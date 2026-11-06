@@ -1,11 +1,9 @@
 include(CTest)
 
 # ---------- Catch2 test binary ----------
-add_executable(arch_test
+set(ARCH_TEST_SOURCES
     test_format.cpp
     test_compressor.cpp
-    test_io_uring.cpp
-    test_prefetch.cpp
     test_archive_writer.cpp
     test_xattr.cpp
     test_crc.cpp
@@ -15,10 +13,19 @@ add_executable(arch_test
     test_toc_serialize.cpp
 )
 
+if(ARCH_WITH_URING)
+    list(APPEND ARCH_TEST_SOURCES
+        test_io_uring.cpp
+        test_prefetch.cpp
+    )
+endif()
+
+add_executable(arch_test ${ARCH_TEST_SOURCES})
+
 target_link_libraries(arch_test PRIVATE
     archiver_lib
-    spdlog::spdlog_headerless
-    Catch2::Catch2
+    spdlog::spdlog
+    Catch2::Catch2WithMain
 )
 
 target_compile_options(arch_test PRIVATE

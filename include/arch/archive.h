@@ -15,10 +15,16 @@ class writer {
 public:
     /// Configuration for the writer.
     struct options {
-        std::string compressor = "zstd";   // compressor name
-        int threads = 4;                  // threads for parallel compression
-        bool dedup = false;               // enable content-aware dedup
-        std::size_t prefetch_window = 16;  // small-file prefetch batch size
+        options() {}  // user-provided: GCC 15 rejects `opts = {}` default
+                      // arguments for nested classes whose only ctor is the
+                      // implicit one with NSDMIs ("required before the end of
+                      // its enclosing class").
+        std::string compressor = "zstd";   // compressor name (factory registry)
+        int compression_level = 3;         // codec level; pinned into the TOC section header
+        int threads = 4;                   // block-compression pool size
+        std::size_t pipeline_depth = 32;   // files in flight in the I/O pipeline (Phase 3)
+        bool dedup = false;                // enable within-section content dedup
+        bool durable = true;               // fsync ordering on finalize/append
     };
 
     explicit writer(std::filesystem::path path, options opts = {});
@@ -65,6 +71,7 @@ public:
         std::uint32_t uid;
         std::uint32_t gid;
         std::uint64_t mtime;
+        std::string link_target;  // symlink target or hardlink canonical path; empty if neither
     };
     std::vector<listing_entry> list() const;
 

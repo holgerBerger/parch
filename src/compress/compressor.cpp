@@ -1,5 +1,7 @@
 #include "arch/compressor.h"
 #include "arch/zstd_impl.h"
+#include <mutex>
+#include <stdexcept>
 #include <unordered_map>
 #include <spdlog/spdlog.h>
 
@@ -7,17 +9,17 @@ namespace arch::compress {
 
 namespace {
     std::mutex g_registry_mtx;
-    std::unordered_map<std::string, std::function<std::unique_ptr<compressor>()>> g_registry;
+    std::unordered_map<std::string, std::function<std::unique_ptr<compressor>(int)>> g_registry;
 }
 
 void register_compressor(std::string_view name,
-                         std::function<std::unique_ptr<compressor>()> factory)
+                         std::function<std::unique_ptr<compressor>(int level)> factory)
 {
     std::lock_guard lk(g_registry_mtx);
     g_registry[std::string(name)] = std::move(factory);
 }
 
-std::unique_ptr<compressor> make_compressor(std::string_view name)
+std::unique_ptr<compressor> make_compressor(std::string_view name, int level)
 {
     std::lock_guard lk(g_registry_mtx);
     auto it = g_registry.find(std::string(name));
@@ -25,7 +27,7 @@ std::unique_ptr<compressor> make_compressor(std::string_view name)
         SPDLOG_WARN("Unknown compressor requested: {}", name);
         throw std::runtime_error("Unknown compressor: " + std::string(name));
     }
-    return it->second();
+    return it->second(level);
 }
 
 } // namespace arch::compress

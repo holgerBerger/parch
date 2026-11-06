@@ -4,6 +4,7 @@
 #include <sys/xattr.h>
 #include <linux/limits.h>
 #include <string.h>
+#include <cstring>
 #include <algorithm>
 
 namespace arch::util {
