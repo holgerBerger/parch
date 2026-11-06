@@ -11,6 +11,7 @@ set(ARCH_TEST_SOURCES
     test_dedup_index.cpp
     test_footer_serialize.cpp
     test_toc_serialize.cpp
+    test_writer_serialize.cpp
 )
 
 if(ARCH_WITH_URING)

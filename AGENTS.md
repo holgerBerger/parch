@@ -35,9 +35,9 @@ docs/                — format spec, test plan, API reference
 ## Architecture & Data Flow
 
 - **writer / reader** use pimpl (`writer::impl`, `reader::impl`) defined inside `writer.cpp`.
-- **Archive format**: seek-based (no streaming format), but writes are **streamed** — blocks `pwrite`d as produced, only TOC metadata + dedup index buffered in RAM. Layout is `archive_header (16B) → [self-contained TOC sections: data blocks + file entries + block entries + string table (+ dedup index)] → TOC table → footer (256B at EOF)`. Spec: `docs/format.md` **v0.2** (2026-11 freeze) — `format.h` structs and size tests are ported to v0.2 (serialization still pending, Phase 2).
+- **Archive format**: seek-based (no streaming format), but writes are **streamed** — blocks `pwrite`d as produced, only TOC metadata + dedup index buffered in RAM. Layout is `archive_header (16B) → [self-contained TOC sections: data blocks + file entries + block entries + string table (+ dedup index)] → TOC table → footer (256B at EOF)`. Spec: `docs/format.md` **v0.2** (2026-11 freeze) — `format.h`, the writer serializers, and the size/conformance tests are all on v0.2.
 - **I/O pipeline (planned, Phase 3)**: worker-thread pool stats/opens/preads **N files concurrently** (the network-FS latency fix — across files, not within one), feeding a block-compression pool sized by `options.threads`. zstd runs `nbWorkers=1`; the pool is the parallelism knob.
-- **io_uring backend (optional, `ARCH_WITH_URING=ON`)**: `io_uring_pool` wraps a raw io_uring ring, dispatches callbacks via a `std::vector` of tag→callback pairs; the `prefetcher` does within-file readahead on it. Slated to become one backend of the pipeline interface — not the primary path.
+- **io_uring backend (optional, `ARCH_WITH_URING=ON`)**: `io_uring_pool` wraps a raw io_uring ring, dispatches callbacks via an `unordered_map` of tag→callback (CQE reaping serialized under `m_cq_mtx`); the `prefetcher` does within-file readahead on it. Slated to become one backend of the pipeline interface — not the primary path.
 - **Compressor plugin system**: factory registry (`register_compressor` / `make_compressor`) with `REGISTER_COMPRESSOR` macro for static init. Each compressor works on single 4 MiB blocks; codec **and level are pinned per TOC section** (Phase 1).
 
 ### Frozen design decisions (v1 — do not re-litigate without updating PLAN.md)
@@ -58,11 +58,11 @@ docs/                — format spec, test plan, API reference
 
 ## Gotchas & Non-Obvious Patterns
 
-### `writer.cpp` — remaining known gaps (Phase 2 in PLAN.md)
-- **Magic write uses comma expressions** (`hdr[0] = 'A', hdr[1] = 'R', …`) — correct but cosmetic; prefer `std::memcpy`.
-- **Symlink target** is appended to the string table but its offset isn't yet stored in a serialized field — `file_entry::symlink_target_id` exists in `format.h` (v0.2); wiring it happens with Phase 2 serialization.
-- **`finalize()`** still buffers the data region in RAM and the TOC section/footer serialization are stubs (offsets no longer clobber the header — string table moved to EOF-chaining — but Phase 2 replaces the whole scheme with section-relative streaming writes).
-- **`block_entry.offset`** is currently data-region-relative in the writer; **frozen convention is section-relative** (PLAN Phase 1 item 7) — changes with Phase 2.
+### `writer.cpp` — serialization notes (Phase 2 done)
+- **Section layout**: `ensure_section()` reserves a zeroed 128-byte `toc_header` at `file_end`; blocks are `pwrite`d live at `section_start + 128 + data_written`; `finalize_section()` appends the serialized tables and patches the header in place. `block_entry.offset` is **section-relative** (frozen convention); `data_offset` is always `TOC_HEADER_SIZE`.
+- **Serializers are field-by-field** per `docs/format.md` offset tables (`serialize_file_entry` etc. in an anonymous namespace with size `abort()` guards) — never `memcpy` a struct. `test/test_writer_serialize.cpp` re-parses archives independently.
+- **String table byte 0 is a reserved NUL sentinel** (`add_string` starts at offset ≥ 1; 0 = "absent" in all ref fields). Xattr/ACL blobs also live in the string table (`add_blob`, no NUL — the xattr format self-terminates); lengths are big-endian per spec (`src/util/xattr.cpp` now matches).
+- **`writer::append()` throws not-implemented** — needs the reader-side footer parser (Phase 4).
 
 ### Resolved (was: Phase 0 compile blockers)
 - `format.h`: renamed `BLOCK_SIZE` → `ARCH_BLOCK_SIZE` (collides with `sys/mount.h` macro); ported to v0.2 layouts (48 B `block_entry` w/ 16-byte `digest128 content_id`, 128 B `file_entry` w/ `symlink_target_id`/`link_target_id`, 128 B `toc_header`, canonical `*_SIZE` constants). Structs are in-memory helpers — never `memcpy`'d; `file_entry` declaration order groups u64→u32→u16 + tail pad to hit exactly 128 B (serialization order follows docs/format.md tables instead).
@@ -91,4 +91,4 @@ docs/                — format spec, test plan, API reference
 - Tests use `mkstemp` for temp files (not Catch2's file helpers).
 
 ## Phase Checklist (current status)
-See PLAN.md for full status. In short: **Phase 0 ✅, Phase 1 ✅** (docs + `format.h` + tests all on v0.2; builds green both flag settings), pipeline ❌ (not written — Phase 3, the network-FS fast path), writer ⚠️ (compiles; still buffers everything in RAM, TOC/footer serialization stubbed — Phase 2), reader ❌ (stubs — Phase 4), CLI ⚠️ (stub `main.cpp` exists — real commands in Phase 5). Next up: **Phase 2 (writer serialization + streaming)** → Phase 3 (pipeline) → Phase 4 (reader) → Phase 5 (CLI).
+See PLAN.md for full status. In short: **Phases 0–2 ✅** (builds green; `format.h` on v0.2; writer streams + serializes spec-conformant archives with `add_tree`, verified by independent re-parse tests — 43/43 default, 49/49 `ARCH_WITH_URING=ON`), pipeline ❌ (not written — Phase 3, the network-FS fast path), reader ❌ (stubs — Phase 4; also carries the deferred `writer::append`), CLI ⚠️ (stub `main.cpp` — Phase 5). Next up: **Phase 3 (I/O pipeline)** → Phase 4 (reader) → Phase 5 (CLI).

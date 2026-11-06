@@ -64,7 +64,7 @@ compression and random per-file access. See `docs/format.md` for the full spec
 | zstd implementation | ✅ Compiles & passes roundtrip tests — header self-contained; real APIs (`ZSTD_c_nbWorkers=1`, `ZSTD_c_compressionLevel`, `crc32c::Crc32c/Extend`); level is the constructor arg (pinned per section in Phase 2) |
 | io_uring pool | ✅ **Optional backend** (`ARCH_WITH_URING=ON`, default OFF) compiles, tests pass (46/46, 100× stress, ASan/UBSan-clean). Fixed: `<liburing.h>`, `next_tag` as member, removed `io_uring_queue_quiesce`, **`io_uring_queue_init` misuse (CQ depth passed as FLAGS ⇒ `IORING_SETUP_R_DISABLED` ring that never completed anything)**, **`drain_and_stop` deadlock** (timed waits + pending-op counter + condvar), and **a CQE-consumption race** (liburing completion reaping is not thread-safe; workers had double-consumed CQEs ⇒ callbacks fired twice ⇒ use-after-free — now serialized under a dedicated reaping mutex, callbacks dispatched outside it). Callback registry is now `unordered_map` (former O(N) perf item, done). |
 | Prefetcher | ✅ **To be superseded** by the thread-pool file pipeline (Phase 3); this io_uring variant stays as the optional backend. Fixed the compile error (raw `new` + `.get()`), the `delete`+`erase` double-free, and a **permanent block in `pop_ready_chunk`** (`m_eof` was only set on a branch that non-empty files never reached). Chunk ownership rewritten to `shared_ptr` held by the io callback itself — the kernel read buffer and completion flag can no longer be freed underneath the worker (was a use-after-free). |
-| Archive writer | ⚠️ Partial — compiles & tests green; `add_file_impl` is now a member (pimpl access fixed), XXH3-**128** dedup hashing wired, dedup hits copy the owner's `compressed_size`/`crc32c`/`compressor_id`, string-table `pwrite` moved off offset 0. `finalize()` still buffers everything in RAM and the TOC section/footer serialization is a stub — Phase 2. `reader` methods are stubs — Phase 4. |
+| Archive writer | ✅ **Serialized (Phase 2)** — blocks `pwrite`d as produced (only TOC metadata + dedup index in RAM), section-relative offsets, field-by-field big-endian TOC/footer via `htobe*_safe`, metadata CRC + footer CRC + signature CRC, durable fsync ordering, `add_tree()` with dirs/symlinks/`symlink_target_id`/hardlink `link_target_id`, dedup wired into both `add_file` paths. Spec conformance test (`test/test_writer_serialize.cpp`) re-parses archives from the offset tables. `append()` deferred to Phase 4 (needs the footer parser). |
 | Xattr util | ⚠️ Partial — `read_xattrs` via `listxattr`/`getxattr`, binary blob format written. `write_xattrs` and ACL functions are skeletons. Compiles. |
 | CMake (FetchContent) | ✅ Configures & builds from scratch: policy-version workaround for crc32c, Catch2 `extras/` module path + `include(Catch)`, `spdlog::spdlog` target, `SOURCE_SUBDIR` for zstd (`build/cmake`) and xxHash (`cmake_unofficial`), `option(ARCH_WITH_URING OFF)` gating pool/prefetch sources + tests. |
 | Tests (Catch2) | ✅ **40/40 passing** (default) / **46/46** (`ARCH_WITH_URING=ON`) — `Catch2WithMain` linked, `test_toc_serialize.cpp` created, `zstd_mt`→`zstd_impl`, crc32c/`make_compressor` API usages real, io_uring tests gated on the flag. |
@@ -141,11 +141,14 @@ docs/
 
 ## Remaining work (ordered)
 
-> **Phase 0 ✅ and Phase 1 ✅ (2026-11):** the project configures, compiles,
-> and tests green (40/40 default, 46/46 `-DARCH_WITH_URING=ON`), and both the
-> spec docs and `format.h`/tests are on the frozen v0.2 layout. Next up is
-> **Phase 2 (writer serialization + streaming)**; the reader and CLI come
-> *after* serialization, since they parse bytes the writer must first produce.
+> **Phases 0–2 ✅ (2026-11):** the project configures, compiles, and tests
+> green (43/43 default, 49/49 `-DARCH_WITH_URING=ON`); docs, `format.h`, and
+> tests are on the frozen v0.2 layout; and the writer now *streams*
+> spec-conformant archives (TOC/footer serialization, dedup, `add_tree`),
+> verified by an independent re-parse test. Next up is **Phase 3 (I/O
+> pipeline)**; the reader and CLI come *after*, since they parse bytes the
+> writer now produces — `writer::append()` lands with the reader's footer
+> parser in Phase 4.
 >
 > **Design decisions frozen (2026-11):** io_uring demoted to an optional
 > backend (`ARCH_WITH_URING`, default OFF) — the primary I/O path is a
@@ -258,7 +261,15 @@ question in the spec **before** serialization code exists:
     truncation point. Update `docs/api.md` (`add_tree`, revised
     `threads`/`prefetch_window` semantics, pipeline options).
 
-### Phase 2: Writer serialization + streaming
+### Phase 2: Writer serialization + streaming — ✅ DONE (2026-11)
+All four items landed in `src/archive/writer.cpp`: field-by-field big-endian
+serializers (never memcpy), streamed `pwrite`s, section-relative offsets,
+metadata-CRC + footer CRC + signature CRC, durable fsync ordering, and
+`writer::add_tree` with directories, symlinks and hardlinks. Conformance is
+covered by `test/test_writer_serialize.cpp`, which re-parses archives straight
+from `docs/format.md` offset tables (footer self-check, TOC metadata CRC,
+block CRCs + decompress roundtrip, dedup single-store, tree relative paths).
+43/43 tests default, 49/49 with `-DARCH_WITH_URING=ON`.
 14. **Stream blocks to disk** — replace the in-RAM `data_region` vector:
     `add_file`/`add_tree` `pwrite` each compressed block as it is produced,
     at `section_start + data_offset`. Buffer only TOC metadata + dedup index
@@ -389,12 +400,6 @@ Open items:
 - **`writer.cpp:69`** — magic write uses comma expressions; cosmetic only —
   all four bytes *are* assigned and match `ARCH_MAGIC`. Prefer `std::memcpy`
   when Phase 2 touches this code.
-- **Symlink target stored but unreferenced** — `add_file_impl` appends the
-  target to the string table but doesn't yet set `file_entry::symlink_target_id`
-  (field exists since Phase 1); lands with Phase 2 serialization.
-- **`block_entry.offset` is still data-region-relative in the writer** —
-  **frozen convention is section-relative (item 7)**; changes in Phase 2.
-- **`finalize()` buffers everything in RAM** and TOC/footer serialization is
-  stubbed — Phase 2 item 14 (streamed `pwrite`s, bounded memory).
-- **Hardlink inode→path map** — `link_target_id` exists in the struct but no
-  writer populates it yet (needs `add_tree`, Phase 2 item 17).
+- **`writer::append()`** throws `not implemented` — the append flow (parse old
+  footer, overwrite it with a new section, re-emit TOC table + footer) needs
+  the reader-side footer parser; lands with Phase 4.

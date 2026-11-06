@@ -42,6 +42,14 @@ public:
     /// Add a file with explicit data (in-memory source).
     void add_file(std::filesystem::path path, std::string_view data);
 
+    /// Recursively add a directory tree as first-class entries: files,
+    /// directories, symlinks (target stored via symlink_target_id), hardlinks
+    /// (duplicates reference the first path via link_target_id), and device
+    /// nodes (metadata-only with rdev). Names are stored relative to `root`;
+    /// the root itself is not an entry. Walk order is deterministic
+    /// (alphabetical per directory).
+    void add_tree(const std::filesystem::path& root);
+
     /// Finalize: write TOC section + footer.
     void finalize();
 
