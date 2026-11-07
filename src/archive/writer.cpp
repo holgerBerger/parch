@@ -311,7 +311,9 @@ void writer::impl::add_file_impl(const std::filesystem::path& name,
                                  const std::filesystem::path& full,
                                  std::uint64_t file_size, int src_fd)
 {
-    if (!comp) {
+    // compressor == "none" stores raw blocks: no codec instance, id 0
+    // (same contract as the pipeline path below).
+    if (!comp && opts.compressor != "none") {
         comp = compress::make_compressor(opts.compressor, opts.compression_level);
         section_compressor_id = comp->id();
     }
@@ -393,8 +395,16 @@ void writer::impl::add_file_impl(const std::filesystem::path& name,
                 }
             }
 
-            // Compress and stream the block to disk immediately.
-            auto cb = comp->compress(raw);
+            // Compress and stream the block to disk immediately
+            // ("none" → raw pass-through, CRC of the stored bytes).
+            compress::compressed_block cb;
+            if (comp) {
+                cb = comp->compress(raw);
+            } else {
+                cb.data = std::move(raw);
+                cb.crc32c = crc32c::Crc32c(cb.data.data(), cb.data.size());
+                cb.compressor_id = format::COMPRESSOR_NONE;
+            }
 
             format::block_entry be{};
             be.offset = DATA_OFFSET + data_written; // section-relative
@@ -767,7 +777,8 @@ void writer::add_file(std::filesystem::path path) {
 void writer::add_file(std::filesystem::path path, std::string_view data) {
     if (d->finalized) throw std::runtime_error("writer already finalized");
     d->ensure_section();
-    if (!d->comp) {
+    // compressor == "none" → raw pass-through (no codec instance, id 0).
+    if (!d->comp && d->opts.compressor != "none") {
         d->comp = compress::make_compressor(d->opts.compressor,
                                             d->opts.compression_level);
         d->section_compressor_id = d->comp->id();
@@ -806,7 +817,14 @@ void writer::add_file(std::filesystem::path path, std::string_view data) {
             }
         }
 
-        auto cb = d->comp->compress(chunk);
+        compress::compressed_block cb;
+        if (d->comp) {
+            cb = d->comp->compress(chunk);
+        } else {
+            cb.data.assign(chunk.begin(), chunk.end());
+            cb.crc32c = crc32c::Crc32c(cb.data.data(), cb.data.size());
+            cb.compressor_id = format::COMPRESSOR_NONE;
+        }
 
         format::block_entry be{};
         be.offset = impl::DATA_OFFSET + d->data_written;

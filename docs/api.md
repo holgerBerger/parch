@@ -8,6 +8,9 @@ The archiver library exposes three layers:
 2. **Format types** — on-disk layout constants and in-memory structs (`include/arch/format.h`)
 3. **Internal API** — low-level I/O, compression, utilities (not public; may change)
 
+The `arch` command-line tool (`src/main.cpp`, section 8) is the reference
+consumer of the public API.
+
 ---
 
 ## 1. Archive Writer
@@ -27,8 +30,10 @@ struct options {
 };
 ```
 
-- `compressor` — name looked up in the compressor factory. Throws
-  `std::runtime_error` at construction if unknown.
+- `compressor` — name looked up in the compressor factory. The special value
+  `"none"` selects **store mode**: blocks are written raw with codec ID 0 and
+  no factory lookup happens (works on every write path — pipeline and serial).
+  Any other name throws `std::runtime_error` at construction if unknown.
 - `compression_level` — passed to the compressor. Recorded in every TOC section
   header (format 0.2) together with the codec ID, upholding the determinism
   contract: *same input + same codec + same level ⇒ byte-identical output*.
@@ -294,6 +299,16 @@ void register_compressor(std::string_view name,
 TOC header.) Factories are invoked while the registry mutex is held — they must
 not re-enter `register_compressor`/`make_compressor`.
 
+`"none"` is a **reserved keyword**, not a registered codec: the writer
+short-circuits it into raw pass-through (ID 0) before ever calling the
+factory, and `make_compressor("none")` throws. Readers resolve stored blocks
+by ID via `make_compressor_by_id(id, level)` (registry probe + ID→name cache);
+ID 0 needs no codec.
+
+```cpp
+std::unique_ptr<compressor> make_compressor_by_id(std::uint8_t id, int level);
+```
+
 ### Registering a new compressor
 
 ```cpp
@@ -484,12 +499,12 @@ class noop_impl : public arch::compress::compressor {
 public:
     explicit noop_impl(int /*level*/) {}
     std::uint8_t id() const override { return 0x11; }
-    std::string_view name() const override { return "none"; }
+    std::string_view name() const override { return "noop"; }
 
     arch::compress::compressed_block compress(std::span<const std::uint8_t> input) override {
         arch::compress::compressed_block b;
         b.data.assign(input.begin(), input.end());
-        b.crc32c = crc32c::Value(reinterpret_cast<const char*>(input.data()), input.size());
+        b.crc32c = crc32c::Crc32c(input.data(), input.size());
         b.compressor_id = 0x11;
         return b;
     }
@@ -500,8 +515,56 @@ public:
         return {input.begin(), input.end()};
     }
 };
-REGISTER_COMPRESSOR("none", noop_impl);
+REGISTER_COMPRESSOR("noop", noop_impl);
 ```
 
-(`crc32c::Value` is the real google/crc32c entry point — the 0.1 doc used a
-non-existent `crc32c::Crc32c`.)
+(`"noop"` is just an example name — don't register under `"none"`, that is the
+writer's reserved store-mode keyword. The real google/crc32c entry points are
+`crc32c::Crc32c(data, size)` / `crc32c::Extend(...)` — there is no
+`crc32c::Value`.)
+
+---
+
+## 8. Command-line tool (`arch`)
+
+**Source:** `src/main.cpp` — built as the `arch` target. All diagnostics and
+progress go to **stderr** (spdlog, colored); `list` rows go to **stdout** so
+they are pipeable. Exit codes: `0` success, `1` runtime/ I/O error, `2` usage
+error. Options may appear before *or* after the command word.
+
+```
+usage: arch create  [opts] <archive> <tree|file...>
+       arch append  [opts] <archive> <tree|file...>
+       arch list    [opts] <archive>
+       arch extract [opts] <archive> [dest]      (dest default: .)
+
+opts:
+  -c, --compressor NAME   zstd (default) or none (store)
+  -l, --level N           compression level (default 3)
+  -j, --threads N         compression / extraction workers (default 4)
+      --depth N           files in flight in the I/O pipeline (default 32)
+      --dedup             within-section content dedup (XXH3-128)
+      --no-sync           skip fsync barriers (faster, less durable)
+  -v, --verbose           debug logging
+  -q, --quiet             errors only
+      --version           print version and exit
+  -h, --help              this text
+```
+
+- `create` / `append` map the options 1:1 onto `writer::options`
+  (`append` uses the `writer::append()` static factory — one new TOC
+  section per invocation). **Directory** arguments go through `add_tree`
+  (names stored relative to the directory); plain **file** arguments go
+  through `add_file` and are stored by their basename (same-basename files
+  from different directories collide, like `tar` without leading dirs).
+- `list` reads metadata only (no data blocks) and prints one row per entry
+  in `ls -l`-style: type+permissions, size, mtime, path, and ` -> target`
+  for symlinks/hardlinks.
+- `extract` maps `-j` onto `reader::options.threads` (when given; otherwise
+  the reader defaults to hardware concurrency) and runs the four-wave
+  `extract_all` pipeline.
+
+**Linking note:** the `arch` target wraps `archiver_lib` in a literal
+`-Wl,--whole-archive ... -Wl,--no-whole-archive` pair inside
+`target_link_libraries` so the `REGISTER_COMPRESSOR` static initializers
+survive linking against the static library.

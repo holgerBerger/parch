@@ -69,8 +69,8 @@ compression and random per-file access. See `docs/format.md` for the full spec
 | I/O pipeline (`arch::io::pipeline`) | ✅ **Done (Phase 3)** — `include/arch/pipeline.h` + `src/io/pipeline.cpp`, always built, plain POSIX: `pipeline_depth` files in flight (open+fstat+xattr+pread), `threads` compression workers, bounded memory via `block_permits` with a per-file liveness cap, submit-order consumption, deterministic bytes, failed-file reaping. Benchmarked: 200 MiB / 200-file tree 0.18 s → 0.04 s (page cache); ASan/UBSan-clean. |
 | Xattr util | ⚠️ Partial — `read_xattrs` via `listxattr`/`getxattr`, binary blob format written. `write_xattrs` and ACL functions are skeletons. Compiles. |
 | CMake (FetchContent) | ✅ Configures & builds from scratch: policy-version workaround for crc32c, Catch2 `extras/` module path + `include(Catch)`, `spdlog::spdlog` target, `SOURCE_SUBDIR` for zstd (`build/cmake`) and xxHash (`cmake_unofficial`), `option(ARCH_WITH_URING OFF)` gating pool/prefetch sources + tests. |
-| Tests (Catch2) | ✅ **66/66 passing** (default) / **72/72** (`ARCH_WITH_URING=ON`) — includes `test/test_pipeline.cpp` (ordered multi-block delivery, errors, empty files, backpressure bounds, dtor-during-inflight, writer recovery + serial/pipeline byte-identity) and `test/test_reader.cpp` (list roundtrip, extract_all byte-compare + links/xattr/mode/times, data/metadata/footer corruption detection, truncation-point drop, `writer::append` two-section/empty/sticky-DEDUP, dedup + pipelined roundtrips, zip-slip unit tests). |
-| CLI (`src/main.cpp`) | ⚠️ Stub exists (usage banner; commands land in Phase 5) so the `arch` target builds |
+| Tests (Catch2) | ✅ **72/72 passing** (default) / **78/78** (`ARCH_WITH_URING=ON`) — includes `test/test_pipeline.cpp` (ordered multi-block delivery, errors, empty files, backpressure bounds, dtor-during-inflight, writer recovery + serial/pipeline byte-identity) and `test/test_reader.cpp` (list roundtrip, extract_all byte-compare + links/xattr/mode/times, data/metadata/footer corruption detection, truncation-point drop, `writer::append` two-section/empty/sticky-DEDUP, dedup + pipelined roundtrips, zip-slip unit tests) and `test/test_cli.cpp` (5 subprocess cases: roundtrip, append-wins, store mode + knobs, error codes/exit statuses, options anywhere). |
+| CLI (`src/main.cpp`) | ✅ **Done (Phase 5)** — `create`/`append`/`list`/`extract` with codec/level/threads/depth/dedup/durability flags; stderr diagnostics, stdout listings, exit codes 0/1/2; links the static lib with `--whole-archive` (compressor registration); `test/test_cli.cpp` covers roundtrips + error codes end-to-end |
 | Test plan (`docs/testing.md`) | ✅ Complete — 50+ planned future tests with priorities |
 
 ## Archive format (summary)
@@ -143,8 +143,8 @@ docs/
 
 ## Remaining work (ordered)
 
-> **Phases 0–4 ✅ (2026-11):** the project configures, compiles, and tests
-> green (66/66 default, 72/72 `-DARCH_WITH_URING=ON`); docs, `format.h`, and
+> **Phases 0–5 ✅ (2026-11):** the project configures, compiles, and tests
+> green (72/72 default, 78/78 `-DARCH_WITH_URING=ON`); docs, `format.h`, and
 > tests are on the frozen v0.2 layout; the writer *streams* spec-conformant
 > archives (TOC/footer serialization, dedup, `add_tree`) verified by an
 > independent re-parse test; `add_tree` runs regular files through the
@@ -152,8 +152,10 @@ docs/
 > — byte-identical to the serial path, ~4.5× faster on a 200-file local
 > bench; and the **Phase 4 reader** parses + validates archives end-to-end,
 > extracts in a parallel wave pipeline, tolerates truncated tails, and is
-> paired with a working `writer::append()` static factory. Next up is
-> **Phase 5 (CLI)**.
+> paired with a working `writer::append()` static factory; and the **Phase 5
+> CLI** (`arch create/append/list/extract`) drives it all end-to-end.
+> Remaining: Phase 7 (ACL roundtrip), Phase 8 (sparse files, deeper
+> corruption tooling).
 >
 > **Design decisions frozen (2026-11):** io_uring demoted to an optional
 > backend (`ARCH_WITH_URING`, default OFF) — the primary I/O path is a
@@ -346,12 +348,22 @@ block CRCs + decompress roundtrip, dedup single-store, tree relative paths).
     append two-section + last-wins extraction, dedup and pipelined archives.
     ASan/UBSan-clean, TSan-clean (0 warnings × 3 runs).
 
-### Phase 5: CLI
-25. **Create `src/main.cpp`** — `arch create <archive> <tree|files...>`,
-    `arch extract <archive> [dest]`, `arch list <archive>`,
-    `arch append <archive> [files...]`, built on `add_tree`/reader. spdlog
-    progress. (Referenced by `CMakeLists.txt:86` — generation fails until it
-    exists.)
+### Phase 5: CLI ✅ (2026-11)
+25. ✅ **`src/main.cpp`** — `arch create [opts] <archive> <tree|file...>`,
+    `arch append [opts] <archive> <tree|file...>`, `arch list <archive>`,
+    `arch extract [opts] <archive> [dest]` (dest default `.`). Options map
+    1:1 to `writer::options`/`reader::options`: `-c/--compressor`
+    (`zstd`|`none`), `-l/--level`, `-j/--threads`, `--depth`, `--dedup`,
+    `--no-sync`, plus `-v/-q` log levels and `-h`. Diagnostics/progress go to
+    stderr (spdlog stderr sink), `list` output to stdout (scriptable).
+    Options accepted before or after the command. Directory args →
+    `add_tree`; plain file args → `add_file` (stored by basename). Exit
+    codes: 0 ok, 1 runtime/I/O error, 2 usage error. `arch` links
+    `archiver_lib` inside an explicit `-Wl,--whole-archive` pair so
+    `REGISTER_COMPRESSOR` static init survives (AGENTS.md linking note
+    resolved; `-c none` store mode also fixed on the serial writer paths,
+    covered by `[none]` tests). Tests: `test/test_cli.cpp` (5 cases) drives
+    the binary as a subprocess.
 
 ### Phase 6: Append support ✅ (landed early, with Phase 4)
 26. ✅ **`writer::append()`** — shipped as the static factory

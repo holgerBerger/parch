@@ -106,7 +106,14 @@ target_compile_options(archiver_lib PRIVATE
 
 # ---------- CLI tool ----------
 add_executable(arch src/main.cpp)
-target_link_libraries(arch PRIVATE archiver_lib spdlog::spdlog)
+target_compile_definitions(arch PRIVATE ARCH_CLI_VERSION="${PROJECT_VERSION}")
+# --whole-archive: REGISTER_COMPRESSOR relies on static initializers inside
+# zstd_impl.o, which the linker would otherwise drop from the static lib
+# (AGENTS.md linking note). Literal items in target_link_libraries keep their
+# order, so the flag pair wraps exactly archiver_lib.
+target_link_libraries(arch PRIVATE
+    "-Wl,--whole-archive" archiver_lib "-Wl,--no-whole-archive"
+    spdlog::spdlog)
 
 # Catch2 (v3)
 FetchContent_Declare(Catch2

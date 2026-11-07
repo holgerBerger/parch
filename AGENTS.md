@@ -10,7 +10,7 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-- **Builds green (2026-11, Phases 0–4 done):** 66/66 tests default; 72/72 with `-DARCH_WITH_URING=ON`. The policy flag is set inside CMakeLists (`CMAKE_POLICY_VERSION_MINIMUM`), not required on the command line anymore.
+- **Builds green (2026-11, Phases 0–5 done):** 72/72 tests default; 78/78 with `-DARCH_WITH_URING=ON`. The policy flag is set inside CMakeLists (`CMAKE_POLICY_VERSION_MINIMUM`), not required on the command line anymore.
 - CMake 3.22+, C++20 compiler. Note: GCC 15 rejects `opts = {}` default arguments for nested classes with only implicit ctors — `writer::options` has an explicit `options() {}` for this; don't remove it. Default build is plain POSIX — **liburing is NOT required**.
 - io_uring backend is opt-in: `-DARCH_WITH_URING=ON` (needs `liburing-devel`/`liburing-dev` via pkg-config) and pulls in `src/io/io_uring_pool.cpp`, `src/io/prefetch.cpp` + their tests.
 - All other deps (spdlog, zstd, crc32c, xxHash) are fetched via FetchContent — no manual install needed.
@@ -31,7 +31,12 @@ test/                — Catch2 tests (one file per subsystem; io_uring tests ga
 docs/                — format spec, test plan, API reference
 ```
 
-`src/main.cpp` is a stub (usage banner) so the `arch` target builds; real commands land in PLAN.md Phase 5.
+`src/main.cpp` is the `arch` CLI (Phase 5): `create` / `append` / `list` /
+`extract`; options map 1:1 to `writer::options` / `reader::options`
+(`-c zstd|none`, `-l`, `-j`, `--depth`, `--dedup`, `--no-sync`, `-v`/`-q`).
+The `arch` target links `archiver_lib` inside a literal
+`-Wl,--whole-archive ... -Wl,--no-whole-archive` pair in CMakeLists — required
+for the `REGISTER_COMPRESSOR` static init (see linking note below).
 
 ## Architecture & Data Flow
 
@@ -73,7 +78,8 @@ docs/                — format spec, test plan, API reference
 - **Liveness bound**: `files_in_flight * per_file_cap < block_permits` (enforced by the ctor by scaling permits up). Without the per-file cap the head file's io thread can starve behind the other in-flight files and the writer deadlocks in `next_block`.
 - The pipeline takes its **own fstat** (submit's size arg is only a slot-count estimate) and reads xattrs/ACLs in the io worker — those round-trips are part of what cross-file concurrency hides. Writer metadata comes from the terminal `pipeline_file`.
 - `add_tree` error path reaps in-flight files (`reap_rest`) so the writer stays usable after a throw; `wait_file_done` on an already-erased seq is a safe no-op.
-- **Linking note**: `REGISTER_COMPRESSOR` uses static initializers — consumers linking `libarchiver_lib.a` statically must use `-Wl,--whole-archive` (or reference a `zstd_impl` symbol) or `make_compressor("zstd")` fails at runtime. Phase 5 CLI should link accordingly or add explicit registration.
+- **Linking note**: `REGISTER_COMPRESSOR` uses static initializers — consumers linking `libarchiver_lib.a` statically must use `-Wl,--whole-archive` (or reference a `zstd_impl` symbol) or `make_compressor("zstd")` fails at runtime. The `arch` CLI does this via literal flag items around the library in `target_link_libraries` (order-preserving).
+- **Store mode**: `options.compressor == "none"` is honoured on every write path (pipeline via `use_compression=false`, serial `add_file_impl`/`add_file(data)` via raw pass-through with `compressor_id = COMPRESSOR_NONE`); don't reintroduce an unconditional `make_compressor` call. `[none]` test guards this.
 
 ### `reader.cpp` — Phase 4 notes
 - **Parsers live in `src/archive/format_parse.h`** (field-by-field BE, mirroring `docs/format.md`; also used by `writer::append`). Tests keep *independent* re-parsers — a symmetric writer/reader bug must not hide.
@@ -83,6 +89,7 @@ docs/                — format spec, test plan, API reference
 - **`block_entry.offset` is section-relative from the `toc_header`** and the data region is `[data_offset, data_offset+data_size)`; extract validates blocks against it.
 - **Hardlink owner resolution** goes through `by_path` (the owner may live in an earlier section); if the owner path doesn't exist on disk at wave-3 time (overwritten by a later regular file, or section dropped), wave 3 extracts the owner's blocks under the duplicate's name instead of linking.
 - **Decompressors are per-thread** (`codec_cache` per pool worker) — zstd CCtx is not thread-safe. The reader shares one `arc_fd` across threads via `pread` only.
+- **CLI (`src/main.cpp`)**: diagnostics/progress → stderr (spdlog stderr sink), `list` rows → stdout (pipeable). Options parse before *or* after the command word. Directory args → `add_tree`, file args → `add_file` (basename storage — same-name files collide, like tar without dirs). Exit codes: 0 / 1 (runtime) / 2 (usage). `test/test_cli.cpp` shells the binary out via `ARCH_CLI_BINARY="$<TARGET_FILE:arch>"` — keep that define in test/CMakeLists.
 - **`extract_all` wave order is load-bearing**: parents before children (workers don't mkdir-race), files before hardlinks (link target must exist), children before directory metadata (a ro-mode dir would block writing into it, and times must be set after contents).
 - xattr restore: `util::write_xattrs(dest, strings.substr(xattr_id))` — the blob is self-terminating (4-byte zero length), so slicing to the end of the string table is safe.
 
@@ -113,4 +120,4 @@ docs/                — format spec, test plan, API reference
 - Tests use `mkstemp` for temp files (not Catch2's file helpers).
 
 ## Phase Checklist (current status)
-See PLAN.md for full status. In short: **Phases 0–4 ✅** (builds green; `format.h` on v0.2; writer streams + serializes spec-conformant archives with pipelined `add_tree`; reader parses/validates/extracts in a parallel wave pipeline with corruption + truncation-tolerance semantics; `writer::append()` static factory works and is covered by two-section roundtrip tests — 66/66 default, 72/72 `ARCH_WITH_URING=ON`; reader is ASan/UBSan-clean and TSan-clean). CLI ⚠️ (stub `main.cpp` — Phase 5). Next up: **Phase 5 (CLI)**.
+See PLAN.md for full status. In short: **Phases 0–5 ✅** (builds green; `format.h` on v0.2; writer streams + serializes spec-conformant archives with pipelined `add_tree`; reader parses/validates/extracts in a parallel wave pipeline with corruption + truncation-tolerance semantics; `writer::append()` static factory works and is covered by two-section roundtrip tests — 72/72 default, 78/78 `ARCH_WITH_URING=ON`; reader is ASan/UBSan-clean and TSan-clean); CLI ✅ (`arch create/append/list/extract`, subprocess-tested, ASan-clean via `[cli]` tests). Remaining: Phase 7 (ACL roundtrip), Phase 8 (sparse files).

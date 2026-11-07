@@ -582,6 +582,51 @@ TEST_CASE("reader extracts a dedup archive byte-identically", "[reader][dedup]")
     CHECK(read_file(out / "dup.bin") == dup);
 }
 
+TEST_CASE("store mode: compressor=none roundtrips raw blocks on all paths",
+          "[reader][none]") {
+    temp_dir td;
+    const auto payload = make_content(1u << 20, 0x51); // 1 MiB random-ish
+    auto d = td.path / "src";
+    write_file(d / "tree.bin", payload);
+    write_file(d / "serial.bin", payload);
+
+    auto arc = archive_in(td, "none.arch");
+    {
+        writer::options o;
+        o.compressor = "none";
+        writer w(arc, o);
+        w.add_file(d / "serial.bin");                       // serial add_file
+        w.add_file("mem.bin", std::string_view(               // in-memory path
+            reinterpret_cast<const char*>(payload.data()), payload.size()));
+        w.add_tree(d);                                      // pipeline path
+        w.finalize();
+    }
+    { // threads = 0 → serial add_tree fallback, still "none"
+        writer::options o;
+        o.compressor = "none";
+        o.threads = 0;
+        auto w = writer::append(arc, o);
+        w.add_tree(d);
+        w.finalize();
+    }
+
+    { // Stored bytes must appear verbatim: no codec ran.
+        file_io f(arc);
+        auto data = f.read(0, f.size);
+        std::vector<std::uint8_t> probe(payload.begin() + 4096,
+                                        payload.begin() + 4096 + 256);
+        auto it = std::search(data.begin(), data.end(), probe.begin(), probe.end());
+        CHECK(it != data.end());
+    }
+
+    reader r(arc);
+    const auto out = td.path / "out";
+    r.extract_all(out);
+    CHECK(read_file(out / "serial.bin") == payload);
+    CHECK(read_file(out / "mem.bin") == payload);
+    CHECK(read_file(out / "tree.bin") == payload);
+}
+
 // ---- pipelined writer feeds the reader ----
 
 TEST_CASE("reader: pipelined multi-file archive extracts fully", "[reader][pipeline]") {
