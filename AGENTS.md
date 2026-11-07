@@ -143,7 +143,7 @@ for the `REGISTER_COMPRESSOR` static init (see linking note below).
 - `writer` and `reader` manage raw `int` file descriptors (not RAII wrappers). On destruction, they close if `fd >= 0`. The writer's destructor does NOT auto-finalize.
 
 ### Small vs large file heuristic (superseded)
-- The old design routed files < 16 MiB (`BLOCK_SIZE * 4`) through an io_uring within-file prefetcher. **Replaced** by the Phase 3 file-level pipeline (concurrency across files); `use_prefetch` and the threshold will go away with it. Until then the prefetch path in `add_file_impl` is a no-op.
+- The old design routed files < 16 MiB (`BLOCK_SIZE * 4`) through an io_uring within-file prefetcher. **Replaced** by the Phase 3 file-level pipeline (concurrency across files); `use_prefetch` and the threshold are gone with it — the standalone prefetcher survives only as an `ARCH_WITH_URING` component with its own tests, not wired into `add_file`.
 
 ## Test Conventions
 - Catch2 v3. `TEST_CASE("name", "[tag1][tag2]")`.
