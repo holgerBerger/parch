@@ -2,6 +2,7 @@
 #include "arch/format.h"
 #include "arch/compressor.h"
 #include "arch/pipeline.h"
+#include "format_parse.h"
 #ifdef ARCH_WITH_URING
 #include "arch/io_uring_pool.h"
 #include "arch/prefetch.h"
@@ -207,6 +208,9 @@ struct writer::impl {
     std::vector<format::toc_section_ref> toc_refs; // finalized sections
     std::uint64_t total_uncompressed = 0;
     std::uint64_t total_compressed = 0;
+    // Footer flags inherited from an existing archive via writer::append()
+    // (OR-ed into the rewritten footer so DEDUP stays sticky).
+    std::uint16_t footer_flags_inherited = 0;
 
     // Hardlink detection across the whole archive: (dev, ino) → first-relative-path.
     std::map<std::pair<std::uint64_t, std::uint64_t>, std::string> inode_paths;
@@ -679,7 +683,8 @@ void writer::impl::write_footer()
     f.reserve(format::FOOTER_SIZE);
     put_raw(f, "AR01", 4);                                            // 0
     put_be<std::uint16_t>(f, 0x0002);                                 // 4  version 0.2
-    put_be<std::uint16_t>(f, opts.dedup ? format::FOOTER_FLAG_DEDUP : 0); // 6
+    put_be<std::uint16_t>(f, static_cast<std::uint16_t>(
+        (opts.dedup ? format::FOOTER_FLAG_DEDUP : 0) | footer_flags_inherited)); // 6
     put_be<std::uint64_t>(f, toc_refs.size());                        // 8
     put_be<std::uint64_t>(f, table_off);                              // 16
     put_be<std::uint64_t>(f, total_uncompressed);                     // 24
@@ -1002,63 +1007,172 @@ void writer::finalize() {
     d->arc_fd = -1;
 }
 
-void writer::append(std::filesystem::path path) {
-    // Append mode (open existing archive, read footer, start a new section
-    // over the old footer) lands together with the reader in Phase 4.
-    (void)path;
-    throw std::runtime_error("writer::append not implemented (Phase 4)");
+// ---- writer::append (Phase 4): open existing archive, keep its sections ----
+//
+// Validates the same chain the reader uses (footer magic + signature CRC +
+// self-check CRC + version + TOC-table CRC), then re-verifies every existing
+// section's metadata CRC so a damaged tail is treated as a clean truncation
+// point (durable-append contract, docs/format.md §CRC scheme). The old TOC
+// table + footer are discarded (ftruncate): the next finalize()/added section
+// rewrites them at the kept-region end.
+
+namespace {
+
+std::vector<std::uint8_t> pread_exact(int fd, std::uint64_t off, std::size_t n,
+                                      const char* what) {
+    std::vector<std::uint8_t> b(n);
+    std::size_t got = 0;
+    while (got < n) {
+        ssize_t r = ::pread(fd, b.data() + got, n - got, static_cast<off_t>(off + got));
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            int e = errno;
+            throw std::system_error(e, std::generic_category(), what);
+        }
+        if (r == 0)
+            throw std::runtime_error(std::string("archive truncated reading ") + what);
+        got += static_cast<std::size_t>(r);
+    }
+    return b;
 }
 
-// ---- reader ----
+} // namespace
 
-struct reader::impl {
-    std::filesystem::path arc_path;
-    int arc_fd{-1};
-    format::footer m_footer{};
-    std::vector<format::toc_section_ref> m_tocs;
-    // Parsed entries across all TOC sections.
-    std::vector<format::file_entry> m_entries;
-    std::string m_string_table;
-};
-
-reader::reader(std::filesystem::path path)
-    : d(std::make_unique<impl>())
+writer::writer(std::filesystem::path path, options opts, append_tag)
+    : d(std::make_unique<impl>(std::move(opts), std::move(path)))
 {
-    d->arc_path = std::move(path);
-    d->arc_fd = ::open(d->arc_path.c_str(), O_RDONLY);
+    d->arc_fd = ::open(d->arc_path.c_str(), O_RDWR);
     if (d->arc_fd < 0) {
         int e = errno;
-        SPDLOG_ERROR("open failed for {}: {}", d->arc_path.c_str(), strerror(e));
-        throw std::system_error(e, std::generic_category(), "open failed");
+        SPDLOG_ERROR("cannot open {} for append: {}", d->arc_path.c_str(), strerror(e));
+        throw std::system_error(e, std::generic_category(),
+                                "cannot open " + d->arc_path.string());
     }
 
-    // Parse footer, TOC refs, entries (skeleton).
+    struct stat st{};
+    if (::fstat(d->arc_fd, &st) != 0)
+        throw std::system_error(errno, std::generic_category(), "fstat failed");
+    const std::uint64_t file_size = static_cast<std::uint64_t>(st.st_size);
+    const std::string& p = d->arc_path.string();
+    if (file_size < format::ARCHIVE_HEADER_SIZE + format::FOOTER_SIZE)
+        throw std::runtime_error("file too small to be a finalized archive: " + p);
+
+    // Footer: authoritative validity check (mirrors src/archive/reader.cpp).
+    auto fbytes = pread_exact(d->arc_fd, file_size - format::FOOTER_SIZE,
+                              format::FOOTER_SIZE, "footer");
+    format::footer footer = detail::parse_footer(fbytes.data());
+    if (std::memcmp(footer.magic.data(), format::FOOTER_MAGIC.data(), 4) != 0)
+        throw std::runtime_error("bad footer magic — not an archive or corrupt: " + p);
+    if (crc32c::Crc32c(fbytes.data(), 248) != footer.signature_crc)
+        throw std::runtime_error("footer signature CRC mismatch in " + p);
+    {
+        std::uint32_t fcrc = crc32c::Extend(0, fbytes.data(), 44);
+        fcrc = crc32c::Extend(fcrc, fbytes.data() + 48, 200);
+        if (fcrc != footer.footer_crc)
+            throw std::runtime_error("footer self-check CRC mismatch in " + p);
+    }
+    if (footer.version > 0x0002)
+        throw std::runtime_error("unsupported archive format version " +
+                                 std::to_string(footer.version));
+
+    const std::uint64_t table_off = footer.toc_table_offset;
+    if (table_off < format::ARCHIVE_HEADER_SIZE ||
+        footer.toc_count >
+            (file_size - format::FOOTER_SIZE - table_off) / format::TOC_SECTION_REF_SIZE)
+        throw std::runtime_error("bogus TOC table in " + p);
+    auto tbytes = pread_exact(d->arc_fd, table_off,
+                              static_cast<std::size_t>(footer.toc_count * format::TOC_SECTION_REF_SIZE),
+                              "TOC table");
+    if (crc32c::Crc32c(tbytes.data(), tbytes.size()) != footer.toc_table_crc)
+        throw std::runtime_error("TOC table CRC mismatch in " + p);
+
+    std::vector<format::toc_section_ref> refs;
+    refs.reserve(footer.toc_count);
+    for (std::size_t i = 0; i < footer.toc_count; ++i)
+        refs.push_back(detail::parse_toc_ref(tbytes.data() +
+                                             i * format::TOC_SECTION_REF_SIZE));
+
+    // Re-verify each section header + metadata CRC. First failure = clean
+    // truncation point: drop that section and everything after it.
+    std::vector<format::toc_section_ref> kept;
+    std::uint64_t uncomp = 0, comp_bytes = 0;
+    std::uint64_t truncate_at = table_off; // all sections kept (default)
+    for (const auto& r : refs) {
+        bool ok = r.offset >= format::ARCHIVE_HEADER_SIZE &&
+                  r.size >= format::TOC_HEADER_SIZE &&
+                  r.offset <= table_off && r.size <= table_off - r.offset;
+        if (ok) {
+            auto hbytes = pread_exact(d->arc_fd, r.offset, format::TOC_HEADER_SIZE,
+                                      "TOC header");
+            auto h = detail::parse_toc_header(hbytes.data());
+            constexpr std::uint32_t toc_magic =
+                (static_cast<std::uint32_t>('T') << 24) |
+                (static_cast<std::uint32_t>('O') << 16) |
+                (static_cast<std::uint32_t>('C') << 8) |
+                static_cast<std::uint32_t>('1');
+            const std::uint64_t sz = r.size;
+            ok = h.magic == toc_magic &&
+                 h.data_offset >= format::TOC_HEADER_SIZE &&
+                 h.data_size <= sz - h.data_offset &&
+                 h.file_table_offset >= h.data_offset + h.data_size &&
+                 h.entry_count <= (sz - h.file_table_offset) / format::FILE_ENTRY_SIZE &&
+                 h.block_table_offset >=
+                     h.file_table_offset + h.entry_count * format::FILE_ENTRY_SIZE &&
+                 h.block_count <= (sz - h.block_table_offset) / format::BLOCK_ENTRY_SIZE;
+            if (ok) {
+                auto tail = pread_exact(d->arc_fd, r.offset + h.file_table_offset,
+                                        static_cast<std::size_t>(sz - h.file_table_offset),
+                                        "TOC metadata");
+                std::array<std::uint8_t, format::TOC_HEADER_SIZE> hb{};
+                std::memcpy(hb.data(), hbytes.data(), hb.size());
+                std::fill(hb.begin() + 92, hb.begin() + 96, std::uint8_t{0});
+                std::uint32_t crc = crc32c::Crc32c(hb.data(), hb.size());
+                crc = crc32c::Extend(crc, tail.data(), tail.size());
+                ok = crc == h.metadata_crc && crc == r.metadata_crc;
+                if (ok) {
+                    // Recompute archive totals from the kept region. tail
+                    // starts exactly at the file_entry table.
+                    for (std::uint64_t i = 0; i < h.entry_count; ++i) {
+                        auto e = detail::parse_file_entry(
+                            tail.data() + i * format::FILE_ENTRY_SIZE);
+                        uncomp += e.uncompressed_size;
+                    }
+                    comp_bytes += h.data_size;
+                }
+            }
+        }
+        if (!ok) {
+            SPDLOG_WARN("{}: TOC section at {} failed validation — truncation "
+                        "point, dropping it and later sections", p, r.offset);
+            truncate_at = (r.offset >= format::ARCHIVE_HEADER_SIZE && r.offset <= table_off)
+                              ? r.offset : table_off;
+            break;
+        }
+        kept.push_back(r);
+    }
+    d->toc_refs = std::move(kept);
+
+    // When everything validated, trust the footer's totals (authoritative,
+    // cheap); otherwise use the recomputed kept-region sums.
+    if (d->toc_refs.size() == refs.size()) {
+        d->total_uncompressed = footer.total_uncompressed_size;
+        d->total_compressed = footer.total_compressed_size;
+    } else {
+        d->total_uncompressed = uncomp;
+        d->total_compressed = comp_bytes;
+    }
+    d->footer_flags_inherited =
+        footer.flags.dedup() ? format::FOOTER_FLAG_DEDUP : 0;
+
+    // Discard the old TOC table + footer; the next write starts at EOF again.
+    if (::ftruncate(d->arc_fd, static_cast<off_t>(truncate_at)) != 0)
+        throw std::system_error(errno, std::generic_category(),
+                                "ftruncate failed on " + p);
+    d->file_end = truncate_at;
 }
 
-reader::~reader() {
-    if (d->arc_fd >= 0) ::close(d->arc_fd);
-}
-
-std::vector<reader::listing_entry> reader::list() const {
-    // Build listing from parsed entries + string table.
-    return {};
-}
-
-void reader::extract(const std::filesystem::path& arc_path,
-                     std::filesystem::path dest) const {
-    // Find entry, seek to blocks, decompress, write.
-}
-
-void reader::extract_all(std::filesystem::path dest) const {
-}
-
-std::vector<std::pair<std::string, std::vector<std::uint8_t>>>
-reader::get_xattrs(const std::filesystem::path&) const {
-    return {};
-}
-
-std::string reader::get_acl(const std::filesystem::path& arc_path) const {
-    return {};
+writer writer::append(std::filesystem::path path, options opts) {
+    return writer(std::move(path), std::move(opts), append_tag{});
 }
 
 } // namespace arch

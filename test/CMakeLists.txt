@@ -13,6 +13,7 @@ set(ARCH_TEST_SOURCES
     test_toc_serialize.cpp
     test_writer_serialize.cpp
     test_pipeline.cpp
+    test_reader.cpp
 )
 
 if(ARCH_WITH_URING)

@@ -40,7 +40,8 @@ struct options {
 - `pipeline_depth` — how many files the I/O pipeline keeps in flight
   (stat → open → read across files). This — not within-file readahead — is the
   network-FS latency mechanism. Replaces the old `prefetch_window`.
-  (Pipeline implementation: PLAN.md Phase 3; until then all I/O is serial.)
+  Implemented (`arch::io::pipeline`); `threads = 0` selects the serial
+  fallback path.
 - `dedup` — when true, each uncompressed block is **XXH3-128** hashed before
   compression; duplicates share physical storage **within the section**.
   Requires a codec honouring the determinism contract. Default `false`.
@@ -87,7 +88,7 @@ Storage rules:
 Archives in-memory data. Path is stored verbatim as the entry name. Data is
 split into 4 MiB blocks, compressed, and CRC32C checksummed.
 
-### `void add_tree(root)` *(planned — Phase 2)*
+### `void add_tree(root)`
 
 Recursively archives the directory tree at `root`:
 - Entry names are stored **relative to `root`** (no leading `/`, no `..`).
@@ -112,12 +113,32 @@ Flushes all in-memory state to disk, per the format spec:
 With `durable = true` the step order is data → fsync → TOC → fsync → TOC
 table + footer → fsync, then the fd is closed.
 
-### `void append(path)`
+### `static writer append(path, opts = {})`
 
-Opens an **existing** finalized archive, reads and validates the footer,
-appends a new **self-contained** TOC section at the old footer position, and
-rewrites TOC table + footer in the durability order above. Dedup does not
-cross sections. Not yet implemented (PLAN.md Phase 6).
+Opens an **existing** finalized archive for appending and returns a writer
+positioned to extend it. Validates the full footer chain (magic, signature
+CRC, self-check CRC, version) plus the TOC-table CRC, then re-verifies every
+existing section's metadata CRC. A section that fails validation (or whose
+ref extends past the TOC table) marks a **clean truncation point**: it and
+all later sections are dropped. The old TOC table + footer are then discarded
+(`ftruncate`) and the kept section refs + totals are inherited, so subsequent
+`add_file`/`add_tree` calls stream a new **self-contained** TOC section at the
+old footer position and `finalize()` rewrites table + footer in the durability
+order above. The footer's `DEDUP` flag is sticky (OR-ed with the inherited
+value). Dedup does not cross sections.
+
+```cpp
+auto w = arch::writer::append("backup.arc");   // default options
+w.add_tree("./delta");
+w.finalize();                                   // archive now has 2 sections
+```
+
+**Throws** `std::system_error` if the file cannot be opened, `std::runtime_error`
+if it is not a valid archive.
+
+**Versioning semantics:** a repeated path in a later section is **not** removed
+from the listing (`list()` shows both), but extraction applies last-occurrence-
+wins — the newest version of the name is what lands on disk.
 
 ---
 
@@ -125,15 +146,30 @@ cross sections. Not yet implemented (PLAN.md Phase 6).
 
 **Header:** `#include <arch/archive.h>`
 
-### `reader::reader(path)`
+### `reader::reader(path, opts = {})`
+
+`reader::options`:
+
+```cpp
+struct options {
+    int threads = 0;   // extract_all worker pool size; 0 → hardware concurrency
+};
+```
+
+`threads` bounds the **extract_all** per-file worker pool (see below); a
+single `extract()` call always blocks the calling thread.
 
 Opens the archive read-only. Validates the footer (self-check + signature
 CRC), reads the TOC table, and parses **section metadata only** (headers,
 entry arrays, string tables) into an in-memory listing — data blocks are never
 read here, because the TOC CRCs cover metadata only (format 0.2 decision).
 
-Sections whose data extends past EOF are treated as a clean truncation point,
-not corruption (crash-recovery rule).
+Validation performed here (no data blocks are read): footer magic, footer
+signature CRC, footer self-check CRC, format version (≤ 0.2), TOC-table CRC,
+per-section `TOC1` magic + header bounds + metadata CRC (recomputed from raw
+bytes with the header's crc field zeroed). A TOC-section ref that extends past
+the TOC table is treated as a clean **truncation point**: that section and all
+later ones are dropped, not an error (crash-recovery rule).
 
 **Throws** `std::system_error` if the file cannot be opened.
 **Throws** `std::runtime_error` if the footer is absent/invalid.
@@ -145,7 +181,7 @@ Returns metadata for every entry across all TOC sections. Fields:
 | Field | Type | Notes |
 |---|---|---|
 | `path` | `std::filesystem::path` | Relative member name |
-| `type` | `format::file_type` | `regular`, `symlink`, `directory`, `blkdev`, `chrdev` |
+| `type` | `format::file_type` | `regular`, `symlink`, `directory`, `blkdev`, `chrdev`, `fifo`, `sock` |
 | `size` | `std::uint64_t` | Uncompressed size |
 | `mode` | `std::uint16_t` | Permission + type bits |
 | `uid` | `std::uint32_t` | Owner UID |
@@ -163,14 +199,29 @@ hardlinks (`link()` against the already-extracted canonical path).
 Names that are absolute or contain `..` path elements are **rejected**
 (zip-slip guard) — the whole entry fails with `std::runtime_error`.
 
-Blocks the calling thread until the entry is fully extracted. (A parallel
-extraction pipeline mirroring the write side: PLAN.md Phase 4.)
+Blocks the calling thread until the entry is fully extracted.
 
 ### `void extract_all(dest)`
 
-Iterates `list()` in order. Creates directory entries first, then regular
-files, symlinks, and hardlink duplicates last (after their canonical target
-exists). Preserves the archive structure rooted at `dest`.
+Extraction pipeline — the mirror of the Phase 3 write side, with the same
+network-FS rationale (per-file latency hidden by running **files in
+parallel**, each file's blocks streamed in order). Four waves:
+
+1. **Directories** created serially (sorted) so workers never race on `mkdir`.
+2. **Regular files, symlinks, FIFOs, devices** extracted on the worker pool
+   (`options.threads`, default `hardware_concurrency`); each worker owns its
+   codec instances (one decompressor per thread — decompressors are not
+   thread-safe). The first failing job is captured and rethrown after the
+   pool drains; remaining jobs stop early.
+3. **Hardlink duplicates** linked (`link()`) to their canonical owner; if the
+   owner is missing (dropped section), the owner's blocks are extracted under
+   the duplicate's name instead.
+4. **Directory metadata** (mode/owner/times/xattrs) applied in reverse order,
+   after all children are in place.
+
+Paths are resolved through the last-occurrence-wins map, so a
+multi-section (appended) archive extracts its newest versions. Empty archive
+regions never touched. Archive structure preserved rooted at `dest`.
 
 ### `get_xattrs(arc_path)`
 
@@ -265,21 +316,26 @@ The static initializer calls `register_compressor` once. After that,
 
 **Not public API — subject to change.**
 
-### Primary path: `arch::io::pipeline` (planned — Phase 3)
+### Primary path: `arch::io::pipeline` (built — Phase 3)
 
 ```cpp
-// Sketch; final names land in Phase 3.
-class file_pipeline {
+// Actual interface (include/arch/pipeline.h). Consumption contract:
+//   seq = submit(path, size_estimate)          // blocks while files_in_flight full
+//   while (next_block(seq, i, blk)) {          // ordered per-file block delivery
+//       ...write/inspect blk...; release_block(seq);   // frees a memory permit
+//   }
+//   fin = wait_file_done(seq);                 // terminal record: stat + xattrs + error
+class pipeline {
 public:
-    struct ready_block {
-        std::uint64_t file_index;   // which file in the list
-        std::uint64_t offset;       // within the file
-        std::vector<std::uint8_t> data;
+    struct options {
+        int files_in_flight = 32;   // concurrent open/pread threads (writer: pipeline_depth)
+        int compress_threads = 4;   // compression pool (writer: options.threads)
+        int block_permits = 96;     // max live blocks in RAM (memory bound)
+        int per_file_cap = 2;       // liveness bound per in-flight file
     };
-    file_pipeline(std::size_t depth /* pipeline_depth */);
-    void start(std::span<const std::filesystem::path> files);
-    std::optional<ready_block> pop();       // blocks; nullopt when drained/failed
-    std::exception_ptr error() const;       // first worker failure, propagated
+    pipeline(options, std::string compressor, int level,
+             bool use_compression, bool dedup);
+    ...
 };
 ```
 

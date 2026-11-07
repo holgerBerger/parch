@@ -64,11 +64,12 @@ compression and random per-file access. See `docs/format.md` for the full spec
 | zstd implementation | ✅ Compiles & passes roundtrip tests — header self-contained; real APIs (`ZSTD_c_nbWorkers=1`, `ZSTD_c_compressionLevel`, `crc32c::Crc32c/Extend`); level is the constructor arg (pinned per section in Phase 2) |
 | io_uring pool | ✅ **Optional backend** (`ARCH_WITH_URING=ON`, default OFF) compiles, tests pass (46/46, 100× stress, ASan/UBSan-clean). Fixed: `<liburing.h>`, `next_tag` as member, removed `io_uring_queue_quiesce`, **`io_uring_queue_init` misuse (CQ depth passed as FLAGS ⇒ `IORING_SETUP_R_DISABLED` ring that never completed anything)**, **`drain_and_stop` deadlock** (timed waits + pending-op counter + condvar), and **a CQE-consumption race** (liburing completion reaping is not thread-safe; workers had double-consumed CQEs ⇒ callbacks fired twice ⇒ use-after-free — now serialized under a dedicated reaping mutex, callbacks dispatched outside it). Callback registry is now `unordered_map` (former O(N) perf item, done). |
 | Prefetcher | ✅ **To be superseded** by the thread-pool file pipeline (Phase 3); this io_uring variant stays as the optional backend. Fixed the compile error (raw `new` + `.get()`), the `delete`+`erase` double-free, and a **permanent block in `pop_ready_chunk`** (`m_eof` was only set on a branch that non-empty files never reached). Chunk ownership rewritten to `shared_ptr` held by the io callback itself — the kernel read buffer and completion flag can no longer be freed underneath the worker (was a use-after-free). |
-| Archive writer | ✅ **Serialized (Phase 2) + pipelined (Phase 3)** — blocks `pwrite`d as produced (only TOC metadata + dedup index in RAM), section-relative offsets, field-by-field big-endian TOC/footer via `htobe*_safe`, metadata CRC + footer CRC + signature CRC, durable fsync ordering, `add_tree()` with dirs/symlinks/`symlink_target_id`/hardlink `link_target_id`, dedup wired into both `add_file` paths. Spec conformance test (`test/test_writer_serialize.cpp`) re-parses archives from the offset tables. `add_tree` regular files stream through the Phase 3 pipeline (`consume_pipelined_file`), byte-identical to the serial fallback (`threads = 0`). `append()` deferred to Phase 4 (needs the footer parser). |
+| Archive writer | ✅ **Serialized (Phase 2) + pipelined (Phase 3)** — blocks `pwrite`d as produced (only TOC metadata + dedup index in RAM), section-relative offsets, field-by-field big-endian TOC/footer via `htobe*_safe`, metadata CRC + footer CRC + signature CRC, durable fsync ordering, `add_tree()` with dirs/symlinks/`symlink_target_id`/hardlink `link_target_id`, dedup wired into both `add_file` paths. Spec conformance test (`test/test_writer_serialize.cpp`) re-parses archives from the offset tables. `add_tree` regular files stream through the Phase 3 pipeline (`consume_pipelined_file`), byte-identical to the serial fallback (`threads = 0`). Static `writer::append(path, opts)` factory implemented (Phase 4): validates footer/table/section CRCs, drops an invalid tail as a clean truncation point, inherits refs + totals, `ftruncate`s the old table + footer. |
+| Archive reader (`src/archive/reader.cpp`) | ✅ **Done (Phase 4)** — full validation chain on open (footer magic + signature CRC + self-check CRC + version + TOC-table CRC + per-section metadata CRC recomputed from raw bytes), metadata-only parse (`list()` never reads data blocks), truncation-tolerant (past-table ref ⇒ drop that section and later), last-occurrence-wins extraction (append = versioning), `extract()` per-entry and `extract_all()` four-wave parallel pool (`reader::options.threads`; dirs → files/symlinks/devices → hardlinks via `link()` → dir metadata), block CRC32C + file CRC32C verification, zip-slip guard, xattr/ACL restore, dedup-aware (duplicates are self-describing). TSan-clean, ASan/UBSan-clean. |
 | I/O pipeline (`arch::io::pipeline`) | ✅ **Done (Phase 3)** — `include/arch/pipeline.h` + `src/io/pipeline.cpp`, always built, plain POSIX: `pipeline_depth` files in flight (open+fstat+xattr+pread), `threads` compression workers, bounded memory via `block_permits` with a per-file liveness cap, submit-order consumption, deterministic bytes, failed-file reaping. Benchmarked: 200 MiB / 200-file tree 0.18 s → 0.04 s (page cache); ASan/UBSan-clean. |
 | Xattr util | ⚠️ Partial — `read_xattrs` via `listxattr`/`getxattr`, binary blob format written. `write_xattrs` and ACL functions are skeletons. Compiles. |
 | CMake (FetchContent) | ✅ Configures & builds from scratch: policy-version workaround for crc32c, Catch2 `extras/` module path + `include(Catch)`, `spdlog::spdlog` target, `SOURCE_SUBDIR` for zstd (`build/cmake`) and xxHash (`cmake_unofficial`), `option(ARCH_WITH_URING OFF)` gating pool/prefetch sources + tests. |
-| Tests (Catch2) | ✅ **51/51 passing** (default) / **57/57** (`ARCH_WITH_URING=ON`) — includes `test/test_pipeline.cpp` (ordered multi-block delivery, errors, empty files, backpressure bounds, dtor-during-inflight, writer recovery + serial/pipeline byte-identity). |
+| Tests (Catch2) | ✅ **66/66 passing** (default) / **72/72** (`ARCH_WITH_URING=ON`) — includes `test/test_pipeline.cpp` (ordered multi-block delivery, errors, empty files, backpressure bounds, dtor-during-inflight, writer recovery + serial/pipeline byte-identity) and `test/test_reader.cpp` (list roundtrip, extract_all byte-compare + links/xattr/mode/times, data/metadata/footer corruption detection, truncation-point drop, `writer::append` two-section/empty/sticky-DEDUP, dedup + pipelined roundtrips, zip-slip unit tests). |
 | CLI (`src/main.cpp`) | ⚠️ Stub exists (usage banner; commands land in Phase 5) so the `arch` target builds |
 | Test plan (`docs/testing.md`) | ✅ Complete — 50+ planned future tests with priorities |
 
@@ -142,15 +143,17 @@ docs/
 
 ## Remaining work (ordered)
 
-> **Phases 0–3 ✅ (2026-11):** the project configures, compiles, and tests
-> green (51/51 default, 57/57 `-DARCH_WITH_URING=ON`); docs, `format.h`, and
+> **Phases 0–4 ✅ (2026-11):** the project configures, compiles, and tests
+> green (66/66 default, 72/72 `-DARCH_WITH_URING=ON`); docs, `format.h`, and
 > tests are on the frozen v0.2 layout; the writer *streams* spec-conformant
 > archives (TOC/footer serialization, dedup, `add_tree`) verified by an
-> independent re-parse test; and `add_tree` now runs regular files through
-> the Phase 3 file-level I/O + compression pipeline (`arch::io::pipeline`)
+> independent re-parse test; `add_tree` runs regular files through the
+> Phase 3 file-level I/O + compression pipeline (`arch::io::pipeline`)
 > — byte-identical to the serial path, ~4.5× faster on a 200-file local
-> bench. Next up is **Phase 4 (reader + `writer::append()`)**; the CLI comes
-> after.
+> bench; and the **Phase 4 reader** parses + validates archives end-to-end,
+> extracts in a parallel wave pipeline, tolerates truncated tails, and is
+> paired with a working `writer::append()` static factory. Next up is
+> **Phase 5 (CLI)**.
 >
 > **Design decisions frozen (2026-11):** io_uring demoted to an optional
 > backend (`ARCH_WITH_URING`, default OFF) — the primary I/O path is a
@@ -319,19 +322,29 @@ block CRCs + decompress roundtrip, dedup single-store, tree relative paths).
 > incl. ASan/UBSan-clean); suites now **51/51 default, 57/57
 > `ARCH_WITH_URING=ON`**.
 
-### Phase 4: Reader
-21. **Deserialization** — `pread` footer, validate self-check + signature
-    CRCs, read TOC table, parse section **metadata only** (item 8 — `list()`
-    never touches data blocks), build in-memory entry list.
-22. **Split out `src/archive/reader.cpp`** — currently stubs inside
-    `writer.cpp`. Block decompression, file reconstruction, symlink and
-    hardlink re-creation (item 11), xattr/ACL restore hooks.
-23. **Extraction pipeline** — mirror of Phase 3 on the restore side:
-    concurrent block reads + parallel decompression + async output writes.
-    A serial single-threaded `extract()` reproduces the network-FS latency
-    problem exactly.
-24. **Roundtrip tests** — create → list → extract → byte-compare, incl.
-    symlinks, hardlinks, xattrs; fill in `test_toc_serialize.cpp`.
+### Phase 4: Reader ✅ (2026-11)
+21. ✅ **Deserialization** — `src/archive/format_parse.h` field-by-field BE
+    parsers (shared with `writer::append()`); footer magic + signature CRC +
+    self-check CRC + version + TOC-table CRC + per-section metadata CRC
+    (recomputed from raw bytes with the header's crc field zeroed); section
+    **metadata only** — `list()` never touches data blocks; past-table refs
+    drop the tail cleanly; `compress::make_compressor_by_id()` resolves
+    codecs from the registry for decompression.
+22. ✅ **Split out `src/archive/reader.cpp`** — reader stubs removed from
+    `writer.cpp`; block CRC + file CRC verification, decompression, symlink +
+    hardlink + FIFO + device reconstruction, mode/uid/gid/times, xattr restore
+    (`util::write_xattrs`); ACL restore wired (no-op until item 27).
+23. ✅ **Extraction pipeline** — `extract_all` runs four waves: dirs (serial)
+    → files/symlinks/devices on `reader::options.threads` workers (default
+    `hardware_concurrency`; per-thread codec cache, first-error capture,
+    early stop) → hardlinks `link()` (owner-block fallback) → dir metadata.
+    Single `extract()` stays blocking per entry.
+24. ✅ **Roundtrip tests** — `test/test_reader.cpp` (15 cases): list fields,
+    byte-compare incl. multi-block/empty files, same-inode hardlink check,
+    xattr roundtrip, mode/mtime restore, corrupted data byte ⇒ block-CRC
+    throw, corrupted metadata/bad footer ⇒ open throw, truncation-point drop,
+    append two-section + last-wins extraction, dedup and pipelined archives.
+    ASan/UBSan-clean, TSan-clean (0 warnings × 3 runs).
 
 ### Phase 5: CLI
 25. **Create `src/main.cpp`** — `arch create <archive> <tree|files...>`,
@@ -340,12 +353,17 @@ block CRCs + decompress roundtrip, dedup single-store, tree relative paths).
     progress. (Referenced by `CMakeLists.txt:86` — generation fails until it
     exists.)
 
-### Phase 6: Append support
-26. **`writer::append()`** — open existing archive, `pread` + validate
-    footer, write a new self-contained TOC section (with its own data and
-    dedup index) at EOF, rewrite TOC table + footer in the item-13 order.
-    Dedup does **not** cross sections (frozen decision: self-containment
-    wins over cross-append space savings).
+### Phase 6: Append support ✅ (landed early, with Phase 4)
+26. ✅ **`writer::append()`** — shipped as the static factory
+    `writer writer::append(path, options = {})` (`src/archive/writer.cpp`):
+    opens O_RDWR, validates the full footer + TOC-table + per-section
+    metadata CRC chain, drops an invalid tail as a clean truncation point,
+    inherits section refs + totals (footer's kept when nothing was dropped),
+    ORs the inherited DEDUP footer flag, `ftruncate`s the old table + footer,
+    then normal `add_tree`/`finalize` write the next self-contained section
+    in the item-13 durability order. Dedup does **not** cross sections
+    (frozen decision: self-containment wins over cross-append space savings).
+    The old member `void append(path)` was impossible (the ctor truncates).
 
 ### Phase 7: Full xattr/ACL
 27. **ACL support** — finish `util::read_acl` (`getfacl`), `util::write_acl`
@@ -417,6 +435,4 @@ Open items:
 - **`writer.cpp:69`** — magic write uses comma expressions; cosmetic only —
   all four bytes *are* assigned and match `ARCH_MAGIC`. Prefer `std::memcpy`
   when Phase 2 touches this code.
-- **`writer::append()`** throws `not implemented` — the append flow (parse old
-  footer, overwrite it with a new section, re-emit TOC table + footer) needs
-  the reader-side footer parser; lands with Phase 4.
+- ~~**`writer::append()`**~~ — implemented in Phase 4 (see item 26).

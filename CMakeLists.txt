@@ -65,6 +65,7 @@ set(ARCHIVER_SOURCES
     src/compress/compressor.cpp
     src/compress/zstd_impl.cpp
     src/archive/writer.cpp
+    src/archive/reader.cpp
     src/io/pipeline.cpp
     src/util/xattr.cpp
 )

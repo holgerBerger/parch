@@ -137,6 +137,8 @@ enum class file_type : std::uint16_t {
     directory = 0040000,
     blkdev   = 0060000,
     chrdev   = 0020000,
+    fifo     = 0010000,
+    sock     = 0140000,
 };
 
 struct file_entry {

@@ -32,6 +32,8 @@ public:
     virtual compressed_block compress(std::span<const std::uint8_t> input) = 0;
 
     /// Decompress a single block. Returns empty vector on failure.
+    /// `level` only matters for codecs that need it to init the decompressor
+    /// context; the block header carries the actual parameters.
     virtual std::vector<std::uint8_t> decompress(
         std::span<const std::uint8_t> input, std::uint32_t expected_uncompressed) = 0;
 
@@ -42,6 +44,13 @@ public:
 /// Factory: build a compressor by name string at the given level.
 /// Throws std::runtime_error for unknown names.
 std::unique_ptr<compressor> make_compressor(std::string_view name, int level);
+
+/// Factory for readers: build a compressor by its on-disk `compressor_id`
+/// (docs/format.md §Compressor Registry). Probes registered factories once
+/// (caching name→id) and instantiates the match at `level` (level only
+/// affects compression; decompression ignores it).
+/// Throws std::runtime_error if no registered codec carries that id.
+std::unique_ptr<compressor> make_compressor_by_id(std::uint8_t id, int level);
 
 /// Register a compressor class. Call once at program init.
 /// Usage: REGISTER_COMPRESSOR("zstd", compress::zstd_impl);

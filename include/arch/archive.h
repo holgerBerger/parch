@@ -53,18 +53,35 @@ public:
     /// Finalize: write TOC section + footer.
     void finalize();
 
-    /// Append an already-finalized section to an existing archive.
-    void append(std::filesystem::path path);
+    /// Open an existing finalized archive for appending: validates the
+    /// footer + TOC table, keeps the existing sections, and truncates the
+    /// old TOC table + footer so the next added section (or `finalize()`'s
+    /// empty one) starts at the old footer position. Dedup never crosses
+    /// sections (frozen). Throws `std::system_error` / `std::runtime_error`
+    /// on a missing or invalid archive.
+    static writer append(std::filesystem::path path, options opts = {});
 
 private:
     struct impl;
     std::unique_ptr<impl> d;
+
+    // Used by the static append() factory: opens the existing archive
+    // O_RDWR (no truncation) after validating footer + TOC table.
+    struct append_tag {};
+    writer(std::filesystem::path path, options opts, append_tag);
 };
 
 /// High-level archive reader / extractor.
 class reader {
 public:
-    explicit reader(std::filesystem::path path);
+    /// Configuration for the reader.
+    struct options {
+        options() {}  // explicit default ctor (GCC 15 nested-class quirk,
+                      // same reason as writer::options)
+        int threads = 0;   // extract_all worker pool size; 0 → hardware concurrency
+    };
+
+    explicit reader(std::filesystem::path path, options opts = {});
     ~reader();
 
     reader(const reader&) = delete;
