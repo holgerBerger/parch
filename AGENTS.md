@@ -33,7 +33,8 @@ test/                — Catch2 tests (one file per subsystem; io_uring tests ga
 bench/               — Phase 9: bench.cpp (`arch_bench` in-process timing + RSS harness,
                        key=value result lines), netfs_delay.c (`libnetfs_delay.so`
                        LD_PRELOAD latency shim), run_bench.sh (full matrix)
-docs/                — format spec, test plan, API reference, benchmarks.md (Phase 9 results)
+docs/                — format spec, test plan, API reference, benchmarks.md (Phase 9 results),
+                       extract-pipeline.md (Phase 10 design, optional/unimplemented)
 ```
 
 `src/main.cpp` is the `arch` CLI (Phase 5): `create` / `append` / `list` /
@@ -152,4 +153,4 @@ for the `REGISTER_COMPRESSOR` static init (see linking note below).
 - Tests use `mkstemp` for temp files (not Catch2's file helpers).
 
 ## Phase Checklist (current status)
-See PLAN.md for full status. In short: **Phases 0–5, 7–9 ✅** (builds green; `format.h` on v0.3-minimal (v0.2 layouts + `COMPRESSOR_SPARSE`); writer streams + serializes spec-conformant archives with pipelined `add_tree`; reader parses/validates/extracts in a parallel wave pipeline with corruption + truncation-tolerance semantics; `writer::append()` static factory works and is covered by two-section roundtrip tests — 89/89 default, 95/95 `ARCH_WITH_URING=ON`; reader is ASan/UBSan-clean and TSan-clean); CLI ✅ (`arch create/append/list/extract/verify`, subprocess-tested, ASan-clean via `[cli]` tests); ACL roundtrip ✅ (libacl, access + default ACLs archived and restored, `[acl]` tests); sparse files + retry + verify ✅ (Phase 8, `test/test_sparse.cpp` 14 cases, ASan/UBSan/TSan-clean); benchmarks + memory profile ✅ (Phase 9, `bench/` + `docs/benchmarks.md` — 28× pipeline create win under simulated netfs latency, extract beats tar everywhere, dedup RAM 36 GiB/PiB). **All phases complete — v1 feature-freeze.**
+See PLAN.md for full status. In short: **Phases 0–5, 7–9 ✅** (builds green; `format.h` on v0.3-minimal (v0.2 layouts + `COMPRESSOR_SPARSE`); writer streams + serializes spec-conformant archives with pipelined `add_tree`; reader parses/validates/extracts in a parallel wave pipeline with corruption + truncation-tolerance semantics; `writer::append()` static factory works and is covered by two-section roundtrip tests — 89/89 default, 95/95 `ARCH_WITH_URING=ON`; reader is ASan/UBSan-clean and TSan-clean); CLI ✅ (`arch create/append/list/extract/verify`, subprocess-tested, ASan-clean via `[cli]` tests); ACL roundtrip ✅ (libacl, access + default ACLs archived and restored, `[acl]` tests); sparse files + retry + verify ✅ (Phase 8, `test/test_sparse.cpp` 14 cases, ASan/UBSan/TSan-clean); benchmarks + memory profile ✅ (Phase 9, `bench/` + `docs/benchmarks.md` — 28× pipeline create win under simulated netfs latency, extract beats tar everywhere, dedup RAM 36 GiB/PiB). **All v1 phases complete.** Optional **Phase 10** (extraction pipeline: kill the metadata re-open, fd-based xattr/ACL, `depth`/`threads` split) is *designed* in `docs/extract-pipeline.md`, not implemented — extraction is RT-bound under netfs latency (13.9 MiB/s) until then.
