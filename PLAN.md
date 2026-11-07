@@ -67,9 +67,9 @@ compression and random per-file access. See `docs/format.md` for the full spec
 | Archive writer | ✅ **Serialized (Phase 2) + pipelined (Phase 3)** — blocks `pwrite`d as produced (only TOC metadata + dedup index in RAM), section-relative offsets, field-by-field big-endian TOC/footer via `htobe*_safe`, metadata CRC + footer CRC + signature CRC, durable fsync ordering, `add_tree()` with dirs/symlinks/`symlink_target_id`/hardlink `link_target_id`, dedup wired into both `add_file` paths. Spec conformance test (`test/test_writer_serialize.cpp`) re-parses archives from the offset tables. `add_tree` regular files stream through the Phase 3 pipeline (`consume_pipelined_file`), byte-identical to the serial fallback (`threads = 0`). Static `writer::append(path, opts)` factory implemented (Phase 4): validates footer/table/section CRCs, drops an invalid tail as a clean truncation point, inherits refs + totals, `ftruncate`s the old table + footer. |
 | Archive reader (`src/archive/reader.cpp`) | ✅ **Done (Phase 4)** — full validation chain on open (footer magic + signature CRC + self-check CRC + version + TOC-table CRC + per-section metadata CRC recomputed from raw bytes), metadata-only parse (`list()` never reads data blocks), truncation-tolerant (past-table ref ⇒ drop that section and later), last-occurrence-wins extraction (append = versioning), `extract()` per-entry and `extract_all()` four-wave parallel pool (`reader::options.threads`; dirs → files/symlinks/devices → hardlinks via `link()` → dir metadata), block CRC32C + file CRC32C verification, zip-slip guard, xattr/ACL restore, dedup-aware (duplicates are self-describing). TSan-clean, ASan/UBSan-clean. |
 | I/O pipeline (`arch::io::pipeline`) | ✅ **Done (Phase 3)** — `include/arch/pipeline.h` + `src/io/pipeline.cpp`, always built, plain POSIX: `pipeline_depth` files in flight (open+fstat+xattr+pread), `threads` compression workers, bounded memory via `block_permits` with a per-file liveness cap, submit-order consumption, deterministic bytes, failed-file reaping. Benchmarked: 200 MiB / 200-file tree 0.18 s → 0.04 s (page cache); ASan/UBSan-clean. |
-| Xattr util | ⚠️ Partial — `read_xattrs` via `listxattr`/`getxattr`, binary blob format written. `write_xattrs` and ACL functions are skeletons. Compiles. |
+| Xattr/ACL util (`src/util/xattr.cpp`) | ✅ **Done (Phase 7)** — `read_xattrs`/`write_xattrs` via `listxattr`/`getxattr`/`setxattr` (binary blob per spec, `system.posix_acl_*` skipped); `read_acl`/`write_acl` on libacl (access + default ACLs, numeric IDs, mask handled); restore failures on ACL-less filesystems log instead of throwing. |
 | CMake (FetchContent) | ✅ Configures & builds from scratch: policy-version workaround for crc32c, Catch2 `extras/` module path + `include(Catch)`, `spdlog::spdlog` target, `SOURCE_SUBDIR` for zstd (`build/cmake`) and xxHash (`cmake_unofficial`), `option(ARCH_WITH_URING OFF)` gating pool/prefetch sources + tests. |
-| Tests (Catch2) | ✅ **72/72 passing** (default) / **78/78** (`ARCH_WITH_URING=ON`) — includes `test/test_pipeline.cpp` (ordered multi-block delivery, errors, empty files, backpressure bounds, dtor-during-inflight, writer recovery + serial/pipeline byte-identity) and `test/test_reader.cpp` (list roundtrip, extract_all byte-compare + links/xattr/mode/times, data/metadata/footer corruption detection, truncation-point drop, `writer::append` two-section/empty/sticky-DEDUP, dedup + pipelined roundtrips, zip-slip unit tests) and `test/test_cli.cpp` (5 subprocess cases: roundtrip, append-wins, store mode + knobs, error codes/exit statuses, options anywhere). |
+| Tests (Catch2) | ✅ **75/75 passing** (default) / **81/81** (`ARCH_WITH_URING=ON`) — includes `test/test_pipeline.cpp` (ordered multi-block delivery, errors, empty files, backpressure bounds, dtor-during-inflight, writer recovery + serial/pipeline byte-identity) and `test/test_reader.cpp` (list roundtrip, extract_all byte-compare + links/xattr/mode/times, data/metadata/footer corruption detection, truncation-point drop, `writer::append` two-section/empty/sticky-DEDUP, dedup + pipelined roundtrips, zip-slip unit tests) and `test/test_cli.cpp` (5 subprocess cases: roundtrip, append-wins, store mode + knobs, error codes/exit statuses, options anywhere) and `test/test_xattr.cpp` `[acl]` cases (trivial-skip, util blob roundtrip, archive→extract ACL equality incl. default ACLs). |
 | CLI (`src/main.cpp`) | ✅ **Done (Phase 5)** — `create`/`append`/`list`/`extract` with codec/level/threads/depth/dedup/durability flags; stderr diagnostics, stdout listings, exit codes 0/1/2; links the static lib with `--whole-archive` (compressor registration); `test/test_cli.cpp` covers roundtrips + error codes end-to-end |
 | Test plan (`docs/testing.md`) | ✅ Complete — 50+ planned future tests with priorities |
 
@@ -143,8 +143,8 @@ docs/
 
 ## Remaining work (ordered)
 
-> **Phases 0–5 ✅ (2026-11):** the project configures, compiles, and tests
-> green (72/72 default, 78/78 `-DARCH_WITH_URING=ON`); docs, `format.h`, and
+> **Phases 0–5, 7 ✅ (2026-11):** the project configures, compiles, and tests
+> green (75/75 default, 81/81 `-DARCH_WITH_URING=ON`); docs, `format.h`, and
 > tests are on the frozen v0.2 layout; the writer *streams* spec-conformant
 > archives (TOC/footer serialization, dedup, `add_tree`) verified by an
 > independent re-parse test; `add_tree` runs regular files through the
@@ -153,9 +153,10 @@ docs/
 > bench; and the **Phase 4 reader** parses + validates archives end-to-end,
 > extracts in a parallel wave pipeline, tolerates truncated tails, and is
 > paired with a working `writer::append()` static factory; and the **Phase 5
-> CLI** (`arch create/append/list/extract`) drives it all end-to-end.
-> Remaining: Phase 7 (ACL roundtrip), Phase 8 (sparse files, deeper
-> corruption tooling).
+> CLI** (`arch create/append/list/extract`) drives it all end-to-end; and
+> **Phase 7** made POSIX ACLs (access + default) first-class on libacl,
+> archive→extract roundtrip-tested.
+> Remaining: Phase 8 (sparse files, deeper corruption tooling).
 >
 > **Design decisions frozen (2026-11):** io_uring demoted to an optional
 > backend (`ARCH_WITH_URING`, default OFF) — the primary I/O path is a
@@ -335,7 +336,7 @@ block CRCs + decompress roundtrip, dedup single-store, tree relative paths).
 22. ✅ **Split out `src/archive/reader.cpp`** — reader stubs removed from
     `writer.cpp`; block CRC + file CRC verification, decompression, symlink +
     hardlink + FIFO + device reconstruction, mode/uid/gid/times, xattr restore
-    (`util::write_xattrs`); ACL restore wired (no-op until item 27).
+    (`util::write_xattrs`); ACL restore wired (real since item 27, Phase 7).
 23. ✅ **Extraction pipeline** — `extract_all` runs four waves: dirs (serial)
     → files/symlinks/devices on `reader::options.threads` workers (default
     `hardware_concurrency`; per-thread codec cache, first-error capture,
@@ -377,10 +378,26 @@ block CRCs + decompress roundtrip, dedup single-store, tree relative paths).
     (frozen decision: self-containment wins over cross-append space savings).
     The old member `void append(path)` was impossible (the ctor truncates).
 
-### Phase 7: Full xattr/ACL
-27. **ACL support** — finish `util::read_acl` (`getfacl`), `util::write_acl`
-    (`setfacl`). Wire into writer/reader.
-28. **ACL roundtrip tests** — verify ACLs survive archive→extract cycle.
+### Phase 7: Full xattr/ACL ✅ (2026-11)
+27. ✅ **ACL support** — `util::read_acl`/`write_acl` implemented on **libacl**
+    (new required system dep via pkg-config, `PkgConfig::LIBACL` on
+    `archiver_lib`). Text capture uses `acl_to_any_text(..., TEXT_NUMERIC_IDS)`
+    so archives restore on hosts without the source names. Blob = POSIX.1e
+    texts concatenated NUL-separated: slot 0 access (skipped when trivial — a
+    mode-derived placeholder is stored only when a default ACL needs slot 1),
+    slot 1 default (directories); the writer's trailing `push_back('\0')`
+    closes the list (self-terminating, like xattr blobs; docs/format.md §ACL
+    Storage updated). `read_xattrs` now skips `system.posix_acl_{access,
+    default}` so ACLs aren't double-stored. Restore: files on the regular
+    path, dirs in wave 4; unsupported-fs errors (EOPNOTSUPP/EPERM) are logged,
+    not thrown. Gotcha: `acl_set_file` rejects named entries without a mask
+    (`acl_calc_mask` required — libacl does NOT do what setfacl does); a
+    base-3-entry text must stay mask-less or the restore grows a spurious
+    mask entry.
+28. ✅ **ACL roundtrip tests** — `test/test_xattr.cpp` (3 `[acl]` cases):
+    trivial→not-stored, util access+default blob roundtrip, full archive→
+    extract ACL equality (getfacl text diff) + `get_acl()` + no posix_acl in
+    the xattr table; skip cleanly (`SKIP()`) on ACL-less filesystems.
 
 ### Phase 8: Robustness
 29. **Corruption detection** — reader verifies block CRC32C before

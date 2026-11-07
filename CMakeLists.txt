@@ -17,6 +17,11 @@ option(ARCH_WITH_URING "Build the optional io_uring backend (requires liburing)"
 
 include(FetchContent)
 
+# libacl (system library) — POSIX ACL capture/restore in util::read_acl/
+# write_acl (Phase 7). Brings its own xattr handling for system.posix_acl_*.
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LIBACL REQUIRED IMPORTED_TARGET libacl)
+
 # ---------- dependencies (all via FetchContent) ----------
 
 # spdlog (bundles fmt as submodule, transitively provides fmt targets)
@@ -91,6 +96,7 @@ target_link_libraries(archiver_lib PUBLIC
     libzstd_static
     crc32c
     xxHash::xxhash
+    PkgConfig::LIBACL
 )
 
 if(ARCH_WITH_URING)

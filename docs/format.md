@@ -241,9 +241,23 @@ Terminated by `length == 0`.
 
 ## ACL Storage
 
-Stored as POSIX.1e textual form (same as `getfacl` output), null-terminated
-string in the string table. Separate access ACL and default ACL stored as
-concatenated null-terminated strings.
+Stored in the string table at `acl_id` as POSIX.1e textual form (`getfacl`
+style, produced/consumed by libacl with **numeric IDs** so archives restore on
+hosts lacking the source names). The access ACL and default ACL are stored as
+concatenated NUL-terminated strings, positional (libacl text carries no
+`default:` marker):
+
+```
+access_text NUL [default_text NUL] [NUL]     (writer appends the final NUL;
+                                              the list ends at an empty string)
+```
+
+- Slot 0 is always the access ACL text (extended entries, `mask::` included).
+  A mode-equivalent (trivial) access ACL is **not** stored at all — the blob
+  is absent (`acl_id = 0`) and the mode bits reconstruct it. When only a
+  default ACL exists, slot 0 holds a trivial base-3 placeholder derived from
+  the mode so the default lands in slot 1.
+- Slot 1 (directories only) is the default ACL text.
 
 ## Block Size
 

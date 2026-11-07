@@ -10,10 +10,10 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-- **Builds green (2026-11, Phases 0–5 done):** 72/72 tests default; 78/78 with `-DARCH_WITH_URING=ON`. The policy flag is set inside CMakeLists (`CMAKE_POLICY_VERSION_MINIMUM`), not required on the command line anymore.
+- **Builds green (2026-11, Phases 0–5, 7 done):** 75/75 tests default; 81/81 with `-DARCH_WITH_URING=ON`. The policy flag is set inside CMakeLists (`CMAKE_POLICY_VERSION_MINIMUM`), not required on the command line anymore.
 - CMake 3.22+, C++20 compiler. Note: GCC 15 rejects `opts = {}` default arguments for nested classes with only implicit ctors — `writer::options` has an explicit `options() {}` for this; don't remove it. Default build is plain POSIX — **liburing is NOT required**.
 - io_uring backend is opt-in: `-DARCH_WITH_URING=ON` (needs `liburing-devel`/`liburing-dev` via pkg-config) and pulls in `src/io/io_uring_pool.cpp`, `src/io/prefetch.cpp` + their tests.
-- All other deps (spdlog, zstd, crc32c, xxHash) are fetched via FetchContent — no manual install needed.
+- **libacl is a required system dep** (`pkg_check_modules(LIBACL REQUIRED ...)`) for the ACL capture/restore in `src/util/xattr.cpp` (Phase 7). All other deps (spdlog, zstd, crc32c, xxHash) are fetched via FetchContent — no manual install needed.
 - Tests: single binary `arch_test` driven by Catch2 v3 + `catch_discover_tests()`. Tags like `[slow]` mark heavy tests.
 
 ## Code Layout
@@ -89,9 +89,16 @@ for the `REGISTER_COMPRESSOR` static init (see linking note below).
 - **`block_entry.offset` is section-relative from the `toc_header`** and the data region is `[data_offset, data_offset+data_size)`; extract validates blocks against it.
 - **Hardlink owner resolution** goes through `by_path` (the owner may live in an earlier section); if the owner path doesn't exist on disk at wave-3 time (overwritten by a later regular file, or section dropped), wave 3 extracts the owner's blocks under the duplicate's name instead of linking.
 - **Decompressors are per-thread** (`codec_cache` per pool worker) — zstd CCtx is not thread-safe. The reader shares one `arc_fd` across threads via `pread` only.
-- **CLI (`src/main.cpp`)**: diagnostics/progress → stderr (spdlog stderr sink), `list` rows → stdout (pipeable). Options parse before *or* after the command word. Directory args → `add_tree`, file args → `add_file` (basename storage — same-name files collide, like tar without dirs). Exit codes: 0 / 1 (runtime) / 2 (usage). `test/test_cli.cpp` shells the binary out via `ARCH_CLI_BINARY="$<TARGET_FILE:arch>"` — keep that define in test/CMakeLists.
 - **`extract_all` wave order is load-bearing**: parents before children (workers don't mkdir-race), files before hardlinks (link target must exist), children before directory metadata (a ro-mode dir would block writing into it, and times must be set after contents).
-- xattr restore: `util::write_xattrs(dest, strings.substr(xattr_id))` — the blob is self-terminating (4-byte zero length), so slicing to the end of the string table is safe.
+- xattr restore: `util::write_xattrs(dest, strings.substr(xattr_id))` — the blob is self-terminating (4-byte zero length), so slicing to the end of the string table is safe. ACL restore is the same pattern (`util::write_acl(dest, strings.substr(acl_id))`, files + wave-4 dirs).
+
+### CLI (`src/main.cpp`)
+- Diagnostics/progress → stderr (spdlog stderr sink), `list` rows → stdout (pipeable). Options parse before *or* after the command word. Directory args → `add_tree`, file args → `add_file` (basename storage — same-name files collide, like tar without dirs). Exit codes: 0 / 1 (runtime) / 2 (usage). `test/test_cli.cpp` shells the binary out via `ARCH_CLI_BINARY="$<TARGET_FILE:arch>"` — keep that define in test/CMakeLists.
+
+### `xattr.cpp` — ACL notes (Phase 7)
+- **ACL blob layout** (docs/format.md §ACL Storage): `access_text NUL [default_text NUL]` + the writer's trailing `NUL` terminator — slot position decides the type (libacl text carries no `default:` marker). `read_acl` stores nothing for mode-equivalent (trivial) access ACLs; when only a default ACL exists it stores a mode-derived base-3 placeholder so the default lands in slot 1. Blobs are self-terminating: callers slice `strings.substr(acl_id)` like xattr blobs.
+- **libacl gotchas**: `acl_set_file` fails **EINVAL** on extended entries without a mask — call `acl_calc_mask`, but only when named entries exist (adding a mask to base-3 text converts a trivial ACL into an extended one on disk). Capture with `acl_to_any_text(..., TEXT_NUMERIC_IDS)` so restores don't need the source's user names.
+- **`read_xattrs` skips `system.posix_acl_access`/`_default`** — ACLs have their own field; don't let them leak into the xattr blob again.
 
 ### Resolved (was: Phase 0 compile blockers)
 - `format.h`: renamed `BLOCK_SIZE` → `ARCH_BLOCK_SIZE` (collides with `sys/mount.h` macro); ported to v0.2 layouts (48 B `block_entry` w/ 16-byte `digest128 content_id`, 128 B `file_entry` w/ `symlink_target_id`/`link_target_id`, 128 B `toc_header`, canonical `*_SIZE` constants). Structs are in-memory helpers — never `memcpy`'d; `file_entry` declaration order groups u64→u32→u16 + tail pad to hit exactly 128 B (serialization order follows docs/format.md tables instead).
@@ -120,4 +127,4 @@ for the `REGISTER_COMPRESSOR` static init (see linking note below).
 - Tests use `mkstemp` for temp files (not Catch2's file helpers).
 
 ## Phase Checklist (current status)
-See PLAN.md for full status. In short: **Phases 0–5 ✅** (builds green; `format.h` on v0.2; writer streams + serializes spec-conformant archives with pipelined `add_tree`; reader parses/validates/extracts in a parallel wave pipeline with corruption + truncation-tolerance semantics; `writer::append()` static factory works and is covered by two-section roundtrip tests — 72/72 default, 78/78 `ARCH_WITH_URING=ON`; reader is ASan/UBSan-clean and TSan-clean); CLI ✅ (`arch create/append/list/extract`, subprocess-tested, ASan-clean via `[cli]` tests). Remaining: Phase 7 (ACL roundtrip), Phase 8 (sparse files).
+See PLAN.md for full status. In short: **Phases 0–5, 7 ✅** (builds green; `format.h` on v0.2; writer streams + serializes spec-conformant archives with pipelined `add_tree`; reader parses/validates/extracts in a parallel wave pipeline with corruption + truncation-tolerance semantics; `writer::append()` static factory works and is covered by two-section roundtrip tests — 75/75 default, 81/81 `ARCH_WITH_URING=ON`; reader is ASan/UBSan-clean and TSan-clean); CLI ✅ (`arch create/append/list/extract`, subprocess-tested, ASan-clean via `[cli]` tests); ACL roundtrip ✅ (libacl, access + default ACLs archived and restored, `[acl]` tests). Remaining: Phase 8 (sparse files).

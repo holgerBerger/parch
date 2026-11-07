@@ -114,7 +114,7 @@ Grouped by subsystem. Priority order is indicated by `P1` (critical), `P2` (impo
 |---|------|-----|----------|
 | U1 | `util::write_xattrs` roundtrip — serialize blob, write to file, read back with `getxattr()` | `[util][xattr]` | P1 |
 | U2 | `util::write_xattrs` on file with existing xattrs — verify overwrite | `[util][xattr]` | P2 |
-| U3 | `util::read_acl` / `write_acl` — when libacl is wired up | `[util][acl]` | P2 |
+| U3 | `util::read_acl` / `write_acl` — libacl roundtrip (implemented Phase 7) | `[util][acl]` | P2 |
 
 ## Test tags / filter strategy
 

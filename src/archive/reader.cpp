@@ -427,7 +427,8 @@ void reader::impl::extract_one(const entry_location& loc,
             }
             if (e.acl_id) {
                 auto sv = strings(loc.section);
-                util::write_acl(dest, zstr(sv, e.acl_id, "ACL text"));
+                // ACL blob is self-terminating (empty string closes it).
+                util::write_acl(dest, sv.substr(e.acl_id));
             }
         }
         if (out >= 0) ::close(out);
@@ -608,6 +609,8 @@ void reader::extract_all(std::filesystem::path dest) const {
         ::utimensat(AT_FDCWD, dpath.c_str(), times, 0);
         if (e.xattr_id)
             util::write_xattrs(dpath, d->strings(loc.section).substr(e.xattr_id));
+        if (e.acl_id) // access + (for dirs) default ACL
+            util::write_acl(dpath, d->strings(loc.section).substr(e.acl_id));
     }
 }
 
@@ -653,7 +656,36 @@ std::string reader::get_acl(const std::filesystem::path& arc_path) const {
     const auto& loc = d->find_entry(arc_path.string());
     const auto& e = d->sections[loc.section].entries[loc.index];
     if (!e.acl_id) return {};
-    return std::string(zstr(d->strings(loc.section), e.acl_id, "ACL text"));
+    const auto sv = d->strings(loc.section);
+    if (e.acl_id >= sv.size())
+        throw std::runtime_error("ACL text: string-table offset past end");
+    // Blob = access NUL [default NUL] (+terminator); render getfacl-style
+    // with "default:" prefixes on the second part.
+    std::string out;
+    std::string_view p = sv.substr(e.acl_id);
+    for (bool first_part = true; !p.empty(); first_part = false) {
+        const auto nul = p.find('\0');
+        const std::string_view text =
+            nul == std::string_view::npos ? p : p.substr(0, nul);
+        if (text.empty()) break;
+        if (first_part) {
+            out += text;
+        } else {
+            out += '\n';
+            std::string_view line = text;
+            while (!line.empty()) {
+                const auto nl = line.find('\n');
+                const std::size_t len = nl == std::string_view::npos ? line.size() : nl;
+                if (len) { out += "default:"; out.append(line.data(), len); out += '\n'; }
+                if (nl == std::string_view::npos) break;
+                line = line.substr(nl + 1);
+            }
+            if (!out.empty() && out.back() == '\n') out.pop_back();
+        }
+        if (nul == std::string_view::npos) break;
+        p = p.substr(nul + 1);
+    }
+    return out;
 }
 
 } // namespace arch

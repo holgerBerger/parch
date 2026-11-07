@@ -238,7 +238,9 @@ std::vector<std::pair<std::string, std::vector<std::uint8_t>>> get_xattrs(path);
 
 ### `get_acl(arc_path)`
 
-Returns the POSIX.1e ACL text (same format as `getfacl` output).
+Returns the POSIX.1e ACL text in `getfacl` form (numeric IDs). When a default
+ACL is stored its entries are prefixed `default:`; empty string when the entry
+has no (non-trivial) ACL.
 
 ---
 
@@ -411,9 +413,13 @@ Reads POSIX extended attributes from `path`, appends them as a binary blob to
 
 Restores xattrs from a previously-saved binary blob.
 
-### `util::read_acl(path, out)` / `util::write_acl(path, text)`
+### `util::read_acl(path, out)` / `util::write_acl(path, blob)`
 
-POSIX.1e ACL getfacl/setfacl wrapper. Pending implementation.
+POSIX.1e ACL capture/restore on libacl (implemented — Phase 7). `read_acl`
+stores non-trivial access ACLs and directory default ACLs as the concatenated
+NUL-terminated text blob in docs/format.md §ACL Storage; mode-equivalent ACLs
+are skipped (return 0). `write_acl` applies slot 0 as the access ACL and slot 1
+as the default ACL; filesystems without ACL support (EOPNOTSUPP) only log.
 
 ---
 
