@@ -161,6 +161,7 @@ std::size_t pipeline::in_flight()
 // within-file readahead (per-file order is the natural delivery order). ----
 void pipeline::io_worker()
 {
+    auto* P = m_opts.prof;   // stage timers (nullable; util/profile.h)
     for (;;) {
         std::uint64_t seq;
         std::shared_ptr<file_state> f;
@@ -177,9 +178,13 @@ void pipeline::io_worker()
             f = front.second;
         }
 
-        int fd = static_cast<int>(arch::detail::retry_io(
-            [&] { return ::open(f->path.c_str(),
-                                O_RDONLY | (f->follow_symlinks ? 0 : O_NOFOLLOW)); }));
+        int fd;
+        {   // STG_OPEN: the open round-trip (network-FS latency lives here)
+            util::profile::span s(P ? P->open : nullptr);
+            fd = static_cast<int>(arch::detail::retry_io(
+                [&] { return ::open(f->path.c_str(),
+                                    O_RDONLY | (f->follow_symlinks ? 0 : O_NOFOLLOW)); }));
+        }
         if (fd < 0) {
             int e = errno;
             std::lock_guard lk(m_mtx);
@@ -190,7 +195,12 @@ void pipeline::io_worker()
         }
 
         struct stat st{};
-        if (arch::detail::retry_io([&] { return ::fstat(fd, &st); }) != 0) {
+        int fstat_rc;
+        {
+            util::profile::span s(P ? P->open : nullptr);
+            fstat_rc = arch::detail::retry_io([&] { return ::fstat(fd, &st); });
+        }
+        if (fstat_rc != 0) {
             int e = errno;
             ::close(fd);
             std::lock_guard lk(m_mtx);
@@ -203,6 +213,7 @@ void pipeline::io_worker()
         // Metadata reads happen here too — on a network FS these round-trips
         // are part of what cross-file concurrency hides.
         try {
+            util::profile::span s(P ? P->meta : nullptr);
             util::read_xattrs(f->path, f->xattr_blob);
             util::read_acl(f->path, f->acl_blob);
         } catch (const std::exception& ex) {
@@ -238,6 +249,7 @@ void pipeline::io_worker()
             // One permit per live block; the per-file cap keeps the head of
             // the queue from starving behind the other in-flight files.
             {
+                util::profile::span s(P ? P->permit_wait : nullptr);
                 std::unique_lock lk(m_mtx);
                 m_cv.wait(lk, [&] {
                     return m_stopping.load(std::memory_order_acquire) ||
@@ -249,8 +261,12 @@ void pipeline::io_worker()
                 f->permits_held++;
             }
 
-            const bool hole =
-                sparse_file && sparse::block_is_hole(fd, off, bsize);
+            bool hole = false;
+            {
+                // block_is_hole issues lseeks (extra RTs on a netfs): reads stage
+                util::profile::span s(P ? P->pread : nullptr);
+                hole = sparse_file && sparse::block_is_hole(fd, off, bsize);
+            }
 
             raw_block rb;
             rb.seq = seq;
@@ -268,9 +284,13 @@ void pipeline::io_worker()
                                         : format::digest128{};
             } else {
                 std::vector<std::uint8_t> raw(bsize);
-                ssize_t n = arch::detail::retry_io(
-                    [&] { return ::pread(fd, raw.data(), bsize,
-                                         static_cast<off_t>(off)); });
+                ssize_t n;
+                {
+                    util::profile::span s(P ? P->pread : nullptr);
+                    n = arch::detail::retry_io(
+                        [&] { return ::pread(fd, raw.data(), bsize,
+                                             static_cast<off_t>(off)); });
+                }
                 if (n <= 0) {
                     int e = errno;
                     std::lock_guard lk(m_mtx);
@@ -283,8 +303,14 @@ void pipeline::io_worker()
                 raw.resize(static_cast<std::size_t>(n));
                 consumed = static_cast<std::size_t>(n);
 
-                fcrc = crc32c::Extend(fcrc, raw.data(), raw.size());
-                rb.content_id = m_dedup ? xxh3_128(raw) : format::digest128{};
+                {
+                    util::profile::span s(P ? P->crc : nullptr);
+                    fcrc = crc32c::Extend(fcrc, raw.data(), raw.size());
+                }
+                {
+                    util::profile::span s(P ? P->hash : nullptr);
+                    rb.content_id = m_dedup ? xxh3_128(raw) : format::digest128{};
+                }
                 rb.data = std::move(raw);
             }
 
@@ -318,6 +344,7 @@ void pipeline::io_worker()
 void pipeline::compress_worker()
 {
     std::unique_ptr<compress::compressor> comp;
+    auto* P = m_opts.prof;
 
     for (;;) {
         raw_block rb;
@@ -359,11 +386,13 @@ void pipeline::compress_worker()
                 blk.compressor_id = format::COMPRESSOR_SPARSE;
             } else if (m_use_compression) {
                 if (!comp) comp = compress::make_compressor(m_compressor, m_level);
+                util::profile::span s(P ? P->compress : nullptr);
                 auto cb = comp->compress(rb.data);
                 blk.compressed = std::move(cb.data);
                 blk.crc32c = cb.crc32c;
                 blk.compressor_id = cb.compressor_id;
             } else {
+                util::profile::span s(P ? P->compress : nullptr); // store: CRC only
                 blk.compressed = std::move(rb.data);
                 blk.crc32c = crc32c::Crc32c(blk.compressed.data(), blk.compressed.size());
                 blk.compressor_id = format::COMPRESSOR_NONE;

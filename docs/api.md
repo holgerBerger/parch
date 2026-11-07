@@ -28,6 +28,7 @@ struct options {
     bool        dedup             = false;// enable within-section content dedup
     bool        durable           = true; // fsync ordering on finalize/append
     bool        sparse            = true; // archive holes as v0.3 sparse blocks
+    bool        profile           = false;// per-stage create timing report (see profile_report())
 };
 ```
 
@@ -63,6 +64,13 @@ struct options {
   blocks of equal size, so they dedup against each other. Setting false
   stores hole bytes like any other data and the archive stays format v0.2.
   Honoured on both the pipeline and serial write paths.
+- `profile` — when true, every stage of the creation pipeline is timed
+  (source open, xattr/ACL reads, block pread, CRC, XXH3 hashing, compress,
+  block-permit wait, tree walk, writer-thread wait, archive pwrite, dedup
+  lookup, TOC + fsync) and a report with tuning hints is printed to stderr
+  by `finalize()`. The pipelined and serial paths report into the same
+  stage slots, so profiles of both are directly comparable. Off cost at a
+  call site is one boolean test; the archive bytes are identical either way.
 
 ### `writer::writer(path, options)`
 
@@ -127,6 +135,30 @@ Flushes all in-memory state to disk, per the format spec:
 
 With `durable = true` the step order is data → fsync → TOC → fsync → TOC
 table + footer → fsync, then the fd is closed.
+
+With `profile = true`, `finalize()` also prints the per-stage create report
+to stderr (see below).
+
+### `std::string profile_report() const`
+
+With `options.profile`: a human-readable per-stage timing breakdown of
+everything added so far plus tuning hints — the writer-side counterpart of
+`reader::profile_report()`. Stages: `source open` (open+fstat round-trips),
+`xattr+read` (metadata reads), `source read` (block preads + `SEEK_DATA`
+hole scans), `crc32c`, `xxh3 dedup` (hashing), `compress`, `permit wait`
+(I/O workers blocked on in-RAM block permits — reads outrunning the
+downstream), `tree walk` (the serial readdir/lstat pass), `writer wait`
+(the single consumer thread blocked on producers), `archive write`,
+`dedup lookup`, and `toc+footer` (serialization + fsync barriers). The
+header line reports file/byte counters, dedup hits + bytes saved, wall
+time and worker utilization. Hints map dominant stages to knobs:
+walk/open/metadata share → `--depth` (or note that only a parallel walk
+helps), compress share → `-j` / lower `-l`, hashing share vs. saved bytes
+→ drop `--dedup`, permit wait → `-j` or destination write wall, writer
+wait → `--depth` (many files) or the staged pipeline for a few huge files
+(`docs/extract-pipeline.md` §4), write+TOC share → `--no-sync`. Cumulative
+across `add_file`/`add_tree`/`finalize`; empty string when profiling is
+off; never affects the archive bytes.
 
 ### `static writer append(path, opts = {})`
 
@@ -392,6 +424,8 @@ public:
         int compress_threads = 4;   // compression pool (writer: options.threads)
         int block_permits = 96;     // max live blocks in RAM (memory bound)
         int per_file_cap = 2;       // liveness bound per in-flight file
+        bool sparse = true;         // emit COMPRESSOR_SPARSE hole blocks
+        profile_hooks* prof = nullptr; // optional writer-owned stage timers
     };
     pipeline(options, std::string compressor, int level,
              bool use_compression, bool dedup);
@@ -595,7 +629,7 @@ opts:
       --depth N           files in flight: I/O pipeline (create) / extract+verify
                           workers (default 32)
       --profile           per-stage timing report + tuning hints on stderr
-                          (extract, verify)
+                          (create, append, extract, verify)
       --dedup             within-section content dedup (XXH3-128)
       --no-sync           skip fsync barriers (faster, less durable)
       --no-sparse         store holes as zero-filled blocks (archive stays v0.2)
@@ -607,7 +641,8 @@ opts:
 
 - `create` / `append` map the options 1:1 onto `writer::options`
   (`append` uses the `writer::append()` static factory — one new TOC
-  section per invocation). **Directory** arguments go through `add_tree`
+  section per invocation); `--profile` sets `writer::options.profile` and
+  the create report is printed by `finalize()`. **Directory** arguments go through `add_tree`
   (names stored relative to the directory); plain **file** arguments go
   through `add_file` and are stored by their basename (same-basename files
   from different directories collide, like `tar` without leading dirs).

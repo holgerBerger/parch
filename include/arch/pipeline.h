@@ -1,6 +1,7 @@
 #pragma once
 
 #include "arch/format.h"
+#include "util/profile.h"
 #include <sys/stat.h>
 #include <atomic>
 #include <cstdint>
@@ -66,12 +67,26 @@ struct pipeline_file {
 /// order, so archive bytes never depend on worker scheduling.
 class pipeline {
 public:
+    /// Optional per-stage timers (writer-owned array; see util/profile.h).
+    /// Null pointer = that stage not measured. The writer's serial fallback
+    /// path reports into the same slots, so profiles are comparable.
+    struct profile_hooks {
+        util::profile::stage_timer *open = nullptr,        // open+fstat per file
+            *meta = nullptr,                               // xattr/ACL reads
+            *pread = nullptr,                              // raw block reads
+            *crc = nullptr,                                // file checksum CRC
+            *hash = nullptr,                               // XXH3-128 dedup hash
+            *permit_wait = nullptr,                        // block-permit stall
+            *compress = nullptr;                           // codec work
+    };
+
     struct options {
         int files_in_flight = 32;   // concurrent open/pread threads (writer pipeline_depth)
         int compress_threads = 4;   // block-compression pool (writer options.threads)
         int block_permits = 96;     // max live blocks (raw or compressed) in RAM
         int per_file_cap = 2;       // max live blocks owned by one file (liveness bound)
         bool sparse = true;         // emit hole blocks as COMPRESSOR_SPARSE (v0.3)
+        profile_hooks* prof = nullptr; // optional stage timers (outlives the pipeline)
     };
 
     /// @param compressor     codec name for the factory registry

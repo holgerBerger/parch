@@ -209,6 +209,19 @@ default depth (359 vs 665 MiB/s, §3.1 addendum): on low-latency storage
 The profile report identifies this correctly (RT stage dominates but
 per-op time is inflated), and the hint text stands as designed.
 
+**Writer-side mirror (2026-11 follow-up, implemented):** the same
+mechanism (extracted to `include/util/profile.h`) instruments create/
+append via `writer::options.profile` — 12 stage slots covering the
+pipeline (open/xattr/pread/CRC/hash/compress/permit-wait, hooked through
+`io::pipeline::options.prof`), the serial tree walk, the single consumer
+thread (`writer wait`, judged against wall — its hint distinguishes
+"many files → raise `--depth`" from "few huge files → Option B's staged
+pipeline is the fix", §4), archive pwrite, dedup lookup and toc+fsync.
+The serial fallback reports into the same slots, and on/off runs are
+byte-identical. So the §4 Option-B gate can now be decided from data:
+run `arch create --profile` on the real workload and read which hint
+fires.
+
 ## 4. Option B — staged `arch::io::extract_pipeline` (only if B is needed)
 
 The faithful mirror of the write pipeline, for read-bandwidth-bound

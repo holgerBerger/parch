@@ -71,7 +71,7 @@ compression and random per-file access. See `docs/format.md` for the full spec
 | CMake (FetchContent) | ✅ Configures & builds from scratch: policy-version workaround for crc32c, Catch2 `extras/` module path + `include(Catch)`, `spdlog::spdlog` target, `SOURCE_SUBDIR` for zstd (`build/cmake`) and xxHash (`cmake_unofficial`), `option(ARCH_WITH_URING OFF)` gating pool/prefetch sources + tests. |
 | Sparse files (`src/io/sparse.h`) | ✅ **Done (Phase 8)** — `SEEK_DATA` hole detection (gated on `st_blocks*512 < st_size`), whole-hole blocks stored as `COMPRESSOR_SPARSE` (zero bytes, format flips to v0.3 only when used, sticky across `append`); hole `content_id` = XXH3-128 of zeros so dense-zero blocks dedup against holes; extraction leaves holes and `ftruncate`s trailing ones. Pipeline + serial paths both honoured. ASan/UBSan/TSan-clean. |
 | Retry + verify (Phase 8) | ✅ **Done** — `src/util/retry.h` `retry_io` (exponential backoff 1→100 ms, 5 attempts, EINTR free) wraps the hot syscalls (pipeline open/fstat/pread, serial pread, reader pread); `reader::verify_all()` + `arch verify` report per-entry block/file CRC failures with block index. |
-| Tests (Catch2) | ✅ **93/93 passing** (default) / **99/99** (`ARCH_WITH_URING=ON`) — includes `test/test_pipeline.cpp` (ordered multi-block delivery, errors, empty files, backpressure bounds, dtor-during-inflight, writer recovery + serial/pipeline byte-identity) and `test/test_reader.cpp` (list roundtrip, extract_all byte-compare + links/xattr/mode/times, data/metadata/footer corruption detection, truncation-point drop, `writer::append` two-section/empty/sticky-DEDUP, dedup + pipelined roundtrips, zip-slip unit tests; `[phase10]`: depth×threads byte-identity matrix, profile report contents + cumulative counters, fd-based xattr/mode restore, parallel-verify error parity) and `test/test_cli.cpp` (5 subprocess cases: roundtrip, append-wins, store mode + knobs, error codes/exit statuses, options anywhere) `test/test_xattr.cpp` `[acl]` cases (trivial-skip, util blob roundtrip, archive→extract ACL equality incl. default ACLs), and `test/test_sparse.cpp` (14 cases: hole roundtrips pipeline+serial, trailing-hole ftruncate restore, partial-hole guard, v0.2/v0.3 footer flip + `options.sparse=false`, hole↔zero dedup under store mode, append v0.3 stickiness, sparse helper equivalence, `retry_io` backoff/EINTR/cap semantics, `verify_all` by-name reporting + hardlink dup). |
+| Tests (Catch2) | ✅ **95/95 passing** (default) / **101/101** (`ARCH_WITH_URING=ON`) — includes `test/test_pipeline.cpp` (ordered multi-block delivery, errors, empty files, backpressure bounds, dtor-during-inflight, writer recovery + serial/pipeline byte-identity) and `test/test_reader.cpp` (list roundtrip, extract_all byte-compare + links/xattr/mode/times, data/metadata/footer corruption detection, truncation-point drop, `writer::append` two-section/empty/sticky-DEDUP, dedup + pipelined roundtrips, zip-slip unit tests; `[phase10]`: depth×threads byte-identity matrix, profile report contents + cumulative counters, fd-based xattr/mode restore, parallel-verify error parity; `[profile]`: writer create-profile report contents + counters + on/off byte-identity, serial-fallback profile) and `test/test_cli.cpp` (5 subprocess cases: roundtrip, append-wins, store mode + knobs, error codes/exit statuses, options anywhere) `test/test_xattr.cpp` `[acl]` cases (trivial-skip, util blob roundtrip, archive→extract ACL equality incl. default ACLs), and `test/test_sparse.cpp` (14 cases: hole roundtrips pipeline+serial, trailing-hole ftruncate restore, partial-hole guard, v0.2/v0.3 footer flip + `options.sparse=false`, hole↔zero dedup under store mode, append v0.3 stickiness, sparse helper equivalence, `retry_io` backoff/EINTR/cap semantics, `verify_all` by-name reporting + hardlink dup). |
 | CLI (`src/main.cpp`) | ✅ **Done (Phase 5)** — `create`/`append`/`list`/`extract`/`verify` with codec/level/threads/depth/dedup/durability/sparse flags; stderr diagnostics, stdout listings, exit codes 0/1/2; links the static lib with `--whole-archive` (compressor registration); `test/test_cli.cpp` covers roundtrips + error codes end-to-end |
 | Test plan (`docs/testing.md`) | ✅ Complete — 50+ planned future tests with priorities |
 | Benchmarks + memory profile (`docs/benchmarks.md`) | ✅ **Done (Phase 9)** — `bench/bench.cpp` (`arch_bench`) + `bench/netfs_delay.c` (LD_PRELOAD 500 µs open+first-read latency shim) + `bench/run_bench.sh` matrix; vs GNU tar 1.35 `--zstd -3`. Headline: pipeline create **28×** faster than tar/serial on many-small-files under simulated netfs latency (97.7 vs 3.5 MiB/s); extract beats tar on every workload (1.3–2.4×); writer RSS 50/97/214 MiB at `-j 1/4/12` (plateau at `-j 4`); dedup index measured ~0.14 KiB/entry ⇒ ~36 GiB/PiB unique (freed per `finalize_section()`, no spill index in v1). |
@@ -148,7 +148,7 @@ docs/
 ## Remaining work (ordered)
 
 > **Phases 0–5, 7–9 ✅ (2026-11):** the project configures, compiles, and tests
-> green (93/93 default, 99/99 `-DARCH_WITH_URING=ON`); docs, `format.h`, and
+> green (95/95 default, 101/101 `-DARCH_WITH_URING=ON`); docs, `format.h`, and
 > tests are on the frozen v0.2 layout; the writer *streams* spec-conformant
 > archives (TOC/footer serialization, dedup, `add_tree`) verified by an
 > independent re-parse test; `add_tree` runs regular files through the
@@ -504,11 +504,22 @@ block CRCs + decompress roundtrip, dedup single-store, tree relative paths).
     210 MiB/s at depth 32 under the 500 µs shim (target ~70–85; Phase 9
     baseline 13.9). Profiler reports per-stage ns + ops with tuning hints
     (RT share → raise depth; permit wait → raise -j or lower -l; CPU share
-    → more cores; read/write share → bandwidth walls). 93/93 default +
-    99/99 `ARCH_WITH_URING=ON` tests; ASan/UBSan/TSan clean; 4 new
+    → more cores; read/write share → bandwidth walls). 95/95 default +
+    101/101 `ARCH_WITH_URING=ON` tests; ASan/UBSan/TSan clean; 4 new
     `[phase10]` tests (depth×threads byte-identity, profile contents +
     cumulative counters, fd-based xattr/mode restore, verify ordering
     parity). Option B not implemented — gate unchanged (needs real NFS).
+36. ✅ **Writer-side profiling** (2026-11 follow-up) — same instrumentation
+    for create/append: shared `stage_timer`/`span` mechanism extracted to
+    `include/util/profile.h`; `io::pipeline::options.prof` binds writer-owned
+    hooks so io/compress workers time open/xattr/pread/CRC/hash/compress/
+    permit-wait; the writer adds tree-walk, writer-thread-wait, archive
+    pwrite, dedup-lookup and toc+fsync spans (serial fallback reports into
+    the same slots). `writer::options.profile` + `writer::profile_report()`,
+    stderr report from `finalize()`, 7 tuning-hint rules; `--profile` now
+    covers create/append in the CLI and `ARCH_BENCH_PROFILE=1` covers the
+    bench create path. 2 new `[profile]` tests incl. on/off byte-identity
+    (95/95 default, 101/101 uring; ASan/UBSan/TSan clean).
 
 
 ## Dependencies
@@ -536,7 +547,7 @@ headers). Default builds are plain POSIX — no liburing needed.
 **Requires:** CMake ≥ 3.22, C++20 compiler (the crc32c policy workaround is
 baked into CMakeLists via `CMAKE_POLICY_VERSION_MINIMUM`). liburing headers
 only with `-DARCH_WITH_URING=ON`.
-**Status: builds & tests green** — 93/93 default, 99/99 with the uring flag
+**Status: builds & tests green** — 95/95 default, 101/101 with the uring flag
 (Phases 0–5, 7, 8 complete).
 
 ## Known issues / tech debt

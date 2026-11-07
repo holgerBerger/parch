@@ -85,6 +85,21 @@ scheduling churn (and on this 4 KiB-file workload the I/O threads race
 ahead of the 4 compression workers, growing queue handoffs). Default 32
 looks conservative here — it is tuned for §3, where it is worth ~28×.
 
+### 2.1 `arch create --profile` (writer-side, 2026-11 follow-up)
+
+The same stage profiler the reader got in Phase 10 now exists for
+create/append (`writer::options.profile`, `arch create/append
+--profile`). It attributes time across source open / xattr / pread / CRC
+/ XXH3 / compress / permit-wait / tree walk / writer wait / archive
+write / dedup lookup / TOC+fsync and prints tuning hints. Verified
+behavior with the §3 shim on a 63-file tree: at `--depth 1` the report
+shows `writer wait` at 97 % of wall with the source-RT stages inflated
+(~270 µs/op) → "raise --depth"; at `--depth 32` wall drops 6× and the
+writer-wait share falls to 63 % of a nearly-empty 15 ms run. On a warm
+local run compress dominates (54 % of busy) → "raise -j / lower -l".
+Archive bytes are identical with profiling on/off (asserted by
+`[profile]` tests).
+
 ## 3. Simulated network filesystem
 
 `LD_PRELOAD=build/libnetfs_delay.so` with `NETFS_DELAY_US=500`,

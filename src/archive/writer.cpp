@@ -5,6 +5,7 @@
 #include "format_parse.h"
 #include "io/sparse.h"
 #include "util/retry.h"
+#include "util/profile.h"
 #ifdef ARCH_WITH_URING
 #include "arch/io_uring_pool.h"
 #include "arch/prefetch.h"
@@ -21,6 +22,8 @@
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <xxhash.h>
+#include <atomic>
+#include <cstdarg>
 #include <cstring>
 #include <cstdlib>
 #include <crc32c/crc32c.h>
@@ -221,6 +224,38 @@ struct writer::impl {
     // Hardlink detection across the whole archive: (dev, ino) → first-relative-path.
     std::map<std::pair<std::uint64_t, std::uint64_t>, std::string> inode_paths;
 
+    // ---- optional creation profile (opts.profile; docs/extract-pipeline.md
+    // instrumentation, writer side). Pipeline + writer stages share one timer
+    // array; the serial fallback reports into the same slots, so profiles of
+    // both paths are directly comparable. Cumulative across add*/finalize.
+    enum stage { STG_OPEN, STG_META, STG_PREAD, STG_CRC, STG_HASH, STG_COMPRESS,
+                 STG_PERMIT_WAIT, STG_WALK, STG_WRITER_WAIT, STG_PWRITE,
+                 STG_DEDUP, STG_TOC, STG_COUNT };
+    mutable util::profile::stage_timer stages[STG_COUNT];
+    mutable std::atomic<std::uint64_t> wall_ns{0};
+    std::atomic<std::uint64_t> files_done{0}, bytes_in{0}, bytes_stored{0};
+    std::atomic<std::uint64_t> dedup_hits{0}, dedup_bytes_saved{0};
+    io::pipeline::profile_hooks prof_hooks; // bound by get_pipeline()
+    std::uint64_t io_threads = 0, comp_threads = 0; // utilization denominator
+
+    util::profile::stage_timer* T(int st) const {
+        return opts.profile ? &stages[st] : nullptr;
+    }
+    static const char* stage_name(int st);
+    std::string profile_report() const;
+    /// Accumulates wall time across the public entry points (add_tree,
+    /// add_file, finalize) so utilization = busy / (wall × pool width).
+    struct wall_rec {
+        const impl* d; std::uint64_t t0;
+        explicit wall_rec(const impl* dd)
+            : d(dd), t0(dd->opts.profile ? util::profile::now_ns() : 0) {}
+        ~wall_rec() {
+            if (d->opts.profile)
+                d->wall_ns.fetch_add(util::profile::now_ns() - t0,
+                                     std::memory_order_relaxed);
+        }
+    };
+
     impl(options o, std::filesystem::path p)
         : opts(std::move(o)), arc_path(std::move(p))
     {
@@ -325,11 +360,14 @@ void writer::impl::add_file_impl(const std::filesystem::path& name,
     }
 
     struct stat st{};
-    if (fstat(src_fd, &st)) {
-        int e = errno;
-        ::close(src_fd);
-        SPDLOG_ERROR("fstat failed for {}: {}", full.c_str(), strerror(e));
-        throw std::system_error(e, std::generic_category(), "fstat failed");
+    {
+        util::profile::span s(T(STG_OPEN)); // the caller's open() + this fstat = 1 RT
+        if (fstat(src_fd, &st)) {
+            int e = errno;
+            ::close(src_fd);
+            SPDLOG_ERROR("fstat failed for {}: {}", full.c_str(), strerror(e));
+            throw std::system_error(e, std::generic_category(), "fstat failed");
+        }
     }
 
     format::file_entry entry{};
@@ -347,11 +385,13 @@ void writer::impl::add_file_impl(const std::filesystem::path& name,
 
     // Xattr / ACL blobs live in the string table (xattr_id/acl_id = offset).
     {
+        util::profile::span s(T(STG_META));
         std::vector<std::uint8_t> blob;
         util::read_xattrs(full, blob);
         if (!blob.empty()) entry.xattr_id = add_blob(blob);
     }
     {
+        util::profile::span s(T(STG_META));
         std::vector<std::uint8_t> blob;
         util::read_acl(full, blob);
         if (!blob.empty()) {
@@ -371,8 +411,11 @@ void writer::impl::add_file_impl(const std::filesystem::path& name,
     try {
         while (off < file_size) {
             std::uint64_t bsize = std::min(format::ARCH_BLOCK_SIZE, file_size - off);
-            const bool hole =
-                sparse_file && io::sparse::block_is_hole(src_fd, off, bsize);
+            bool hole = false;
+            {
+                util::profile::span s(T(STG_PREAD)); // SEEK_DATA lseeks = extra RTs
+                hole = sparse_file && io::sparse::block_is_hole(src_fd, off, bsize);
+            }
 
             std::vector<std::uint8_t> raw;
             std::uint64_t n = bsize;
@@ -382,9 +425,13 @@ void writer::impl::add_file_impl(const std::filesystem::path& name,
                 file_crc = io::sparse::crc_extend_zeros(file_crc, bsize);
             } else {
                 raw.resize(bsize);
-                ssize_t r = detail::retry_io([&] {
-                    return ::pread(src_fd, raw.data(), bsize,
-                                   static_cast<off_t>(off)); });
+                ssize_t r;
+                {
+                    util::profile::span s(T(STG_PREAD));
+                    r = detail::retry_io([&] {
+                        return ::pread(src_fd, raw.data(), bsize,
+                                       static_cast<off_t>(off)); });
+                }
                 if (r <= 0) {
                     int e = errno;
                     SPDLOG_ERROR("pread failed for {} at offset {}: {}",
@@ -393,13 +440,20 @@ void writer::impl::add_file_impl(const std::filesystem::path& name,
                 }
                 raw.resize(static_cast<std::size_t>(r));
                 n = static_cast<std::uint64_t>(r);
-                file_crc = crc32c::Extend(file_crc, raw.data(), raw.size());
+                {
+                    util::profile::span s(T(STG_CRC));
+                    file_crc = crc32c::Extend(file_crc, raw.data(), raw.size());
+                }
             }
 
             // Dedup check (within-section, spec §Deduplication).
             format::digest128 blk_hash{};
             if (opts.dedup) {
-                blk_hash = hole ? io::sparse::zero_digest(n) : hash_block(raw);
+                {
+                    util::profile::span s(T(STG_HASH));
+                    blk_hash = hole ? io::sparse::zero_digest(n) : hash_block(raw);
+                }
+                util::profile::span s(T(STG_DEDUP));
                 auto hit = dedup_lookup.find(blk_hash);
                 if (hit != dedup_lookup.end()) {
                     // Duplicate: self-describing copy of the owner's fields.
@@ -415,6 +469,9 @@ void writer::impl::add_file_impl(const std::filesystem::path& name,
                         used_sparse = true;
                     dedup_index[hit->second].ref_count++;
                     blocks.push_back(be);
+                    dedup_hits.fetch_add(1, std::memory_order_relaxed);
+                    dedup_bytes_saved.fetch_add(owner.compressed_size,
+                                                std::memory_order_relaxed);
                     off += n;
                     continue;
                 }
@@ -430,8 +487,10 @@ void writer::impl::add_file_impl(const std::filesystem::path& name,
                 cb.compressor_id = format::COMPRESSOR_SPARSE;
                 used_sparse = true;
             } else if (comp) {
+                util::profile::span s(T(STG_COMPRESS));
                 cb = comp->compress(raw);
             } else {
+                util::profile::span s(T(STG_COMPRESS)); // store: CRC only
                 cb.data = std::move(raw);
                 cb.crc32c = crc32c::Crc32c(cb.data.data(), cb.data.size());
                 cb.compressor_id = format::COMPRESSOR_NONE;
@@ -439,8 +498,12 @@ void writer::impl::add_file_impl(const std::filesystem::path& name,
 
             format::block_entry be{};
             be.offset = DATA_OFFSET + data_written; // section-relative
-            write_at(section_start + be.offset, cb.data.data(), cb.data.size());
+            {
+                util::profile::span s(T(STG_PWRITE));
+                write_at(section_start + be.offset, cb.data.data(), cb.data.size());
+            }
             data_written += cb.data.size();
+            bytes_stored.fetch_add(cb.data.size(), std::memory_order_relaxed);
 
             be.compressed_size   = static_cast<std::uint32_t>(cb.data.size());
             be.uncompressed_size = static_cast<std::uint32_t>(n);
@@ -450,6 +513,7 @@ void writer::impl::add_file_impl(const std::filesystem::path& name,
             blocks.push_back(be);
 
             if (opts.dedup) {
+                util::profile::span s(T(STG_DEDUP));
                 dedup_lookup[blk_hash] = dedup_index.size();
                 dedup_index.push_back(
                     {blk_hash, be.offset, blocks.size() - 1, 1});
@@ -467,6 +531,8 @@ void writer::impl::add_file_impl(const std::filesystem::path& name,
     entry.block_count = blocks.size() - entry.block_list_offset;
     total_uncompressed += entry.uncompressed_size;
     entries.push_back(entry);
+    files_done.fetch_add(1, std::memory_order_relaxed);
+    bytes_in.fetch_add(entry.uncompressed_size, std::memory_order_relaxed);
 }
 
 void writer::impl::add_metadata_entry(const std::filesystem::path& name,
@@ -529,6 +595,18 @@ io::pipeline* writer::impl::get_pipeline() {
         po.sparse = opts.sparse;
         // block_permits / per_file_cap keep their defaults; the constructor
         // scales the pool to the per-file liveness bound.
+        if (opts.profile) {
+            prof_hooks.open        = &stages[STG_OPEN];
+            prof_hooks.meta        = &stages[STG_META];
+            prof_hooks.pread       = &stages[STG_PREAD];
+            prof_hooks.crc         = &stages[STG_CRC];
+            prof_hooks.hash        = &stages[STG_HASH];
+            prof_hooks.permit_wait = &stages[STG_PERMIT_WAIT];
+            prof_hooks.compress    = &stages[STG_COMPRESS];
+            po.prof = &prof_hooks;
+        }
+        io_threads  = static_cast<std::uint64_t>(po.files_in_flight);
+        comp_threads = static_cast<std::uint64_t>(po.compress_threads);
         pipe = std::make_unique<io::pipeline>(
             po, opts.compressor, opts.compression_level,
             /*use_compression=*/ opts.compressor != "none", opts.dedup);
@@ -546,9 +624,18 @@ void writer::impl::consume_pipelined_file(const std::string& rel, std::uint64_t 
 
     std::size_t i = 0;
     io::pipeline_block pb;
-    while (pipe->next_block(seq, i, pb)) {
+    bool more;
+    // Writer-idle indicator: time blocked waiting for the producers. Kept
+    // out of the busy-share hints (it is one thread vs. the pool) and
+    // reported against wall instead.
+    {
+        util::profile::span s(T(STG_WRITER_WAIT));
+        more = pipe->next_block(seq, i, pb);
+    }
+    while (more) {
         bool dup = false;
         if (opts.dedup) {
+            util::profile::span s(T(STG_DEDUP));
             auto hit = dedup_lookup.find(pb.content_id);
             if (hit != dedup_lookup.end()) {
                 // Duplicate: self-describing copy of the owner's fields.
@@ -565,13 +652,20 @@ void writer::impl::consume_pipelined_file(const std::string& rel, std::uint64_t 
                 dedup_index[hit->second].ref_count++;
                 blocks.push_back(be);
                 dup = true;
+                dedup_hits.fetch_add(1, std::memory_order_relaxed);
+                dedup_bytes_saved.fetch_add(owner.compressed_size,
+                                            std::memory_order_relaxed);
             }
         }
         if (!dup) {
             format::block_entry be{};
             be.offset = DATA_OFFSET + data_written; // section-relative
-            write_at(section_start + be.offset, pb.compressed.data(), pb.compressed.size());
+            {
+                util::profile::span s(T(STG_PWRITE));
+                write_at(section_start + be.offset, pb.compressed.data(), pb.compressed.size());
+            }
             data_written += pb.compressed.size();
+            bytes_stored.fetch_add(pb.compressed.size(), std::memory_order_relaxed);
 
             be.compressed_size   = static_cast<std::uint32_t>(pb.compressed.size());
             be.uncompressed_size = pb.uncompressed_size;
@@ -583,6 +677,7 @@ void writer::impl::consume_pipelined_file(const std::string& rel, std::uint64_t 
             blocks.push_back(be);
 
             if (opts.dedup) {
+                util::profile::span s(T(STG_DEDUP));
                 dedup_lookup[pb.content_id] = dedup_index.size();
                 dedup_index.push_back(
                     {pb.content_id, be.offset, blocks.size() - 1, 1});
@@ -591,6 +686,10 @@ void writer::impl::consume_pipelined_file(const std::string& rel, std::uint64_t 
         pipe->release_block(seq);
         pb = io::pipeline_block{};
         i++;
+        {
+            util::profile::span s(T(STG_WRITER_WAIT));
+            more = pipe->next_block(seq, i, pb);
+        }
     }
 
     auto fin = pipe->wait_file_done(seq);
@@ -621,6 +720,8 @@ void writer::impl::consume_pipelined_file(const std::string& rel, std::uint64_t 
 
     total_uncompressed += entry.uncompressed_size;
     entries.push_back(entry);
+    files_done.fetch_add(1, std::memory_order_relaxed);
+    bytes_in.fetch_add(entry.uncompressed_size, std::memory_order_relaxed);
 }
 
 // Write file_entry[], block_entry[], string table, dedup index; compute the
@@ -628,6 +729,9 @@ void writer::impl::consume_pipelined_file(const std::string& rel, std::uint64_t 
 void writer::impl::finalize_section()
 {
     if (!section_open) return;
+    // Serialize + table writes + the data→fsync→TOC barriers: one stage
+    // ("toc+footer") so fsync time is never counted twice.
+    util::profile::span toc(T(STG_TOC));
 
     std::vector<std::uint8_t> file_tbl, block_tbl, dedup_tbl;
     file_tbl.reserve(entries.size() * format::FILE_ENTRY_SIZE);
@@ -712,6 +816,7 @@ void writer::impl::finalize_section()
 
 void writer::impl::write_footer()
 {
+    util::profile::span toc(T(STG_TOC));
     // TOC table: array of toc_section_ref records.
     std::vector<std::uint8_t> table;
     table.reserve(toc_refs.size() * format::TOC_SECTION_REF_SIZE);
@@ -765,6 +870,139 @@ void writer::impl::write_footer()
     sync_now();
 }
 
+
+// ---- creation profile (docs/extract-pipeline.md instrumentation) ----
+
+const char* writer::impl::stage_name(int st) {
+    switch (st) {
+        case STG_OPEN:        return "source open  ";
+        case STG_META:        return "xattr+read   ";
+        case STG_PREAD:       return "source read  ";
+        case STG_CRC:         return "crc32c       ";
+        case STG_HASH:        return "xxh3 dedup   ";
+        case STG_COMPRESS:    return "compress     ";
+        case STG_PERMIT_WAIT: return "permit wait  ";
+        case STG_WALK:        return "tree walk    ";
+        case STG_WRITER_WAIT: return "writer wait  ";
+        case STG_PWRITE:      return "archive write";
+        case STG_DEDUP:       return "dedup lookup ";
+        case STG_TOC:         return "toc+footer   ";
+        default:              return "?            ";
+    }
+}
+
+// Busy-share report over the pooled stages + tuning hints. Worker
+// utilization divides busy time by (wall x (io_threads + compress_threads +
+// writer thread)); `writer wait` is additionally interpreted against wall
+// (it is one thread blocked on the producers, not pool parallelism).
+std::string writer::impl::profile_report() const
+{
+    if (!opts.profile) return {};
+    static const char* const names[STG_COUNT] = {
+        stage_name(STG_OPEN), stage_name(STG_META), stage_name(STG_PREAD),
+        stage_name(STG_CRC), stage_name(STG_HASH), stage_name(STG_COMPRESS),
+        stage_name(STG_PERMIT_WAIT), stage_name(STG_WALK),
+        stage_name(STG_WRITER_WAIT), stage_name(STG_PWRITE),
+        stage_name(STG_DEDUP), stage_name(STG_TOC)};
+    char line[512];
+    std::string table;
+    const std::uint64_t busy = util::profile::append_stage_table(
+        table, stages, names, STG_COUNT);
+    std::string out;
+    const std::uint64_t wns = wall_ns.load();
+    const double wall = wns / 1e9;
+    const std::uint64_t threads = io_threads + comp_threads + 1;
+    const double util = wns > 0 && threads > 0
+        ? double(busy) / (double(wns) * double(threads)) : 0.0;
+    const double bin = double(bytes_in.load());
+    const double bytes_st = double(bytes_stored.load());
+    std::snprintf(line, sizeof line,
+                  "arch create profile: %llu files, %.1f MiB read -> %.1f MiB "
+                  "stored (%.1f%%), dedup %llu hits / %.1f MiB saved, %.3f s "
+                  "wall, io=%llu compress=%llu writer=1, busy=%.2f s "
+                  "(%.1f%% worker utilization)\n",
+                  (unsigned long long)files_done.load(), bin / (1 << 20),
+                  bytes_st / (1 << 20),
+                  bin > 0 ? 100.0 * bytes_st / bin : 0.0,
+                  (unsigned long long)dedup_hits.load(),
+                  double(dedup_bytes_saved.load()) / (1 << 20), wall,
+                  (unsigned long long)io_threads,
+                  (unsigned long long)comp_threads, busy / 1e9, 100.0 * util);
+    out += line;
+    out += table;
+
+    auto frac = [&](int st) {
+        return busy ? double(stages[st].ns.load()) / double(busy) : 0.0;
+    };
+    std::uint64_t hints = 0;
+    auto add_hint = [&](const char* fmt, ...) {
+        va_list ap;
+        va_start(ap, fmt);
+        std::vsnprintf(line, sizeof line, fmt, ap);
+        va_end(ap);
+        out += line;
+        ++hints;
+    };
+    if (busy == 0 || wns == 0) return out;
+
+    const double src_rt = frac(STG_WALK) + frac(STG_OPEN) + frac(STG_META);
+    if (src_rt > 0.30) {
+        if (frac(STG_WALK) > 0.20)
+            add_hint("arch create hint: the tree walk (readdir+lstat, single "
+                     "threaded) is %.0f%% of worker time — depth cannot help "
+                     "it; parallelizing the walk is the remaining latency win "
+                     "on netfs\n", frac(STG_WALK) * 100.0);
+        else
+            add_hint("arch create hint: source-side RTs (walk+open+xattr) are "
+                     "%.0f%% of worker time — latency-bound: raise --depth "
+                     "(currently %zu)%s\n", src_rt * 100.0,
+                     opts.pipeline_depth,
+                     opts.pipeline_depth >= 128
+                         ? " (already deep: the source FS's metadata rate is "
+                           "the floor)"
+                         : "");
+    }
+    if (frac(STG_COMPRESS) > 0.45)
+        add_hint("arch create hint: compression is %.0f%% of worker time — "
+                 "CPU-bound: raise -j (now %d, up to core count) or trade "
+                 "ratio for speed with a lower -l\n",
+                 frac(STG_COMPRESS) * 100.0, opts.threads);
+    if (frac(STG_HASH) > 0.15)
+        add_hint("arch create hint: XXH3 dedup hashing is %.0f%% of worker "
+                 "time and dedup saved %.1f MiB of %.1f stored — if that "
+                 "ratio is poor, drop --dedup\n", frac(STG_HASH) * 100.0,
+                 double(dedup_bytes_saved.load()) / (1 << 20),
+                 bytes_st / (1 << 20));
+    if (frac(STG_PERMIT_WAIT) > 0.15)
+        add_hint("arch create hint: I/O workers stall %.0f%% of worker time "
+                 "on block permits — reads outrun the downstream (compress "
+                 "%.0f%%, archive write %.0f%%): raise -j, or the destination "
+                 "write path is the wall\n", frac(STG_PERMIT_WAIT) * 100.0,
+                 frac(STG_COMPRESS) * 100.0, frac(STG_PWRITE) * 100.0);
+    const double ww = wns > 0
+        ? double(stages[STG_WRITER_WAIT].ns.load()) / double(wns) : 0.0;
+    if (ww > 0.35)
+        add_hint("arch create hint: the writer thread is %.0f%% idle waiting "
+                 "for blocks — producers limit the run: many files -> raise "
+                 "--depth (now %zu); a few huge files -> one I/O thread per "
+                 "file caps lookahead at 2 blocks (staged pipeline, "
+                 "docs/extract-pipeline.md section 4, is the fix)\n",
+                 ww * 100.0, opts.pipeline_depth);
+    const double dst = frac(STG_PWRITE) + frac(STG_TOC);
+    if (dst > 0.30)
+        add_hint("arch create hint: archive writes + TOC/fsync are %.0f%% of "
+                 "worker time — destination bandwidth/durability wall; "
+                 "--no-sync removes the fsync barriers (toc+footer %.0f%% "
+                 "includes them)\n", dst * 100.0, frac(STG_TOC) * 100.0);
+    if (util < 0.25 && src_rt <= 0.30 && frac(STG_PERMIT_WAIT) <= 0.15 && ww <= 0.35)
+        add_hint("arch create hint: workers are only %.0f%% busy and no stage "
+                 "dominates — stalls sit between spans (kernel waits): raise "
+                 "--depth (now %zu)\n", util * 100.0, opts.pipeline_depth);
+    if (hints == 0)
+        out += "arch create hint: no single dominant bottleneck\n";
+    return out;
+}
+
 writer::writer(std::filesystem::path path, options opts)
     : d(std::make_unique<impl>(std::move(opts), std::move(path)))
 {
@@ -788,7 +1026,10 @@ writer::~writer() {
     if (d->arc_fd >= 0) ::close(d->arc_fd);
 }
 
+std::string writer::profile_report() const { return d->profile_report(); }
+
 void writer::add_file(std::filesystem::path path) {
+    impl::wall_rec wall(&*d);
     if (d->finalized) throw std::runtime_error("writer already finalized");
     d->ensure_section();
 
@@ -812,6 +1053,7 @@ void writer::add_file(std::filesystem::path path) {
 }
 
 void writer::add_file(std::filesystem::path path, std::string_view data) {
+    impl::wall_rec wall(&*d);
     if (d->finalized) throw std::runtime_error("writer already finalized");
     d->ensure_section();
     // compressor == "none" → raw pass-through (no codec instance, id 0).
@@ -891,6 +1133,7 @@ void writer::add_file(std::filesystem::path path, std::string_view data) {
 
 void writer::add_tree(const std::filesystem::path& root) {
     if (d->finalized) throw std::runtime_error("writer already finalized");
+    impl::wall_rec wall(&*d);
 
     struct stat rst{};
     if (::stat(root.c_str(), &rst) || !S_ISDIR(rst.st_mode)) {
@@ -934,6 +1177,11 @@ void writer::add_tree(const std::filesystem::path& root) {
 
     walk_dir(fs::absolute(root), std::string());
 
+    {
+        // readdir + lstat + readlink per entry: on a network FS this is a full
+        // metadata pass over the tree (walked serially today — see the walk
+        // stage hint). Scoped so the timer stops before consumption.
+        util::profile::span walk(d->T(impl::STG_WALK));
     while (!stack.empty()) {
         auto [abs, rel] = stack.back();
         stack.pop_back();
@@ -971,6 +1219,7 @@ void writer::add_tree(const std::filesystem::path& root) {
             it.kind = tree_item::kMeta; // blk/chr/fifo/sock: metadata-only
         }
         items.push_back(std::move(it));
+    }
     }
 
     // ---- consumption, strictly in walk order ----
@@ -1054,12 +1303,19 @@ void writer::add_tree(const std::filesystem::path& root) {
 
 void writer::finalize() {
     if (d->finalized) return;
+    impl::wall_rec wall(&*d);
     d->ensure_section();    // an empty archive still gets one (empty) section
     d->finalize_section();
     d->write_footer();
     d->finalized = true;
     ::close(d->arc_fd);
     d->arc_fd = -1;
+
+    if (d->opts.profile) {
+        const auto report = d->profile_report();
+        std::fputs(report.c_str(), stderr);
+        std::fflush(stderr);
+    }
 }
 
 // ---- writer::append (Phase 4): open existing archive, keep its sections ----

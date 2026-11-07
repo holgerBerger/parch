@@ -268,6 +268,7 @@ static void run_arch(const cfg& c, uint64_t inb) {
         o.compression_level = c.level;
         o.threads = c.threads;
         o.pipeline_depth = c.depth;
+        o.profile = std::getenv("ARCH_BENCH_PROFILE") != nullptr;
         o.dedup = c.dedup;
         o.sparse = c.sparse;
         arch::writer w(arc, o);

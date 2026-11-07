@@ -26,6 +26,9 @@ public:
         bool dedup = false;                // enable within-section content dedup
         bool durable = true;               // fsync ordering on finalize/append
         bool sparse = true;                // archive holes as sparse blocks (v0.3)
+        bool profile = false;              // collect per-stage create timings;
+                                           // report emitted on stderr by finalize(),
+                                           // see profile_report()
     };
 
     explicit writer(std::filesystem::path path, options opts = {});
@@ -53,6 +56,12 @@ public:
 
     /// Finalize: write TOC section + footer.
     void finalize();
+
+    /// With options.profile: a human-readable per-stage timing breakdown of
+    /// everything added so far (also printed to stderr by finalize()). Empty
+    /// string when profiling is off. Cumulative across add_file/add_tree/
+    /// finalize; covers both the pipelined and the serial fallback paths.
+    std::string profile_report() const;
 
     /// Open an existing finalized archive for appending: validates the
     /// footer + TOC table, keeps the existing sections, and truncates the

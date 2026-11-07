@@ -42,7 +42,7 @@ struct cli_opts {
     bool durable = true;
     bool sparse = true;
     bool threads_given = false;   // reader default = hardware concurrency
-    bool profile = false;         // reader::options.profile (extract/verify)
+    bool profile = false;         // writer/reader options.profile (create/append/extract/verify)
     // ui
     spdlog::level::level_enum log_level = spdlog::level::info;
 };
@@ -63,7 +63,7 @@ struct cli_opts {
         "      --depth N           files in flight: I/O pipeline (create) / extract+verify\n"
         "                          workers (default 32)\n"
         "      --profile           per-stage timing report + tuning hints on stderr\n"
-        "                          (extract, verify)\n"
+        "                          (create, append, extract, verify)\n"
         "      --dedup             within-section content dedup (XXH3-128)\n"
         "      --no-sync           skip fsync barriers (faster, less durable)\n"
         "      --no-sparse         store holes as zero-filled blocks (archive stays v0.2)\n"
@@ -132,6 +132,7 @@ arch::writer::options writer_opts(const cli_opts& o) {
     w.dedup = o.dedup;
     w.durable = o.durable;
     w.sparse = o.sparse;
+    w.profile = o.profile;
     return w;
 }
 
