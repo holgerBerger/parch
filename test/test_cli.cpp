@@ -9,6 +9,8 @@
 #include <string>
 #include <vector>
 #include <unistd.h>
+#include <grp.h>
+#include <pwd.h>
 
 #ifndef ARCH_CLI_BINARY
 #define ARCH_CLI_BINARY "build/arch"   // override via compile definition
@@ -69,6 +71,11 @@ bool contains(const std::string& hay, const std::string& needle) {
     return hay.find(needle) != std::string::npos;
 }
 
+// whole-line match (plain `list` is one path per line)
+bool has_line(const std::string& out, const std::string& line) {
+    return contains("\n" + out + "\n", "\n" + line + "\n");
+}
+
 void write_file(const std::filesystem::path& p, const std::string& content) {
     std::filesystem::create_directories(p.parent_path());
     std::ofstream os(p, std::ios::binary);
@@ -101,8 +108,12 @@ TEST_CASE("cli: create + list + extract roundtrip", "[cli]") {
 
     r = run(cli("list '" + arc.string() + "'"));
     REQUIRE(r.code == 0);
-    CHECK(contains(r.out, "-rw"));
-    CHECK(contains(r.out, "src/a.txt"));        // tar-like: top dir included
+    CHECK(r.out == "src\nsrc/a.txt\nsrc/deep\nsrc/deep/b.bin\nsrc/link.txt\n"); // tar tf: paths only
+    CHECK_FALSE(contains(r.out, "->"));
+
+    r = run(cli("list -v '" + arc.string() + "'"));
+    REQUIRE(r.code == 0);
+    CHECK(contains(r.out, "-rw"));              // tar tv: detailed rows
     CHECK(contains(r.out, "src/deep/b.bin"));
     CHECK(contains(r.out, "src/link.txt -> a.txt"));
     CHECK(contains(r.out, "drwx"));
@@ -113,6 +124,45 @@ TEST_CASE("cli: create + list + extract roundtrip", "[cli]") {
     CHECK(read_file(out / "src/a.txt") == "alpha contents");
     CHECK(read_file(out / "src/deep/b.bin") == std::string(70000, 'Z'));
     CHECK(std::filesystem::read_symlink(out / "src/link.txt") == "a.txt");
+}
+
+TEST_CASE("cli: list -v adds owner/group column", "[cli]") {
+    temp_dir td;
+    write_file(td.path / "src/f.txt", "hello owner");
+    const auto arc = td.path / "t.arc";
+    REQUIRE(run(cli("create -q '" + arc.string() + "' '" +
+                    (td.path / "src").string() + "'")).code == 0);
+
+    // resolve the expected names exactly like the CLI does: numeric fallback
+    // when NSS has no entry for our euid/egid.
+    std::string owner = std::to_string(geteuid());
+    {
+        char buf[1024];
+        struct passwd pw{};
+        struct passwd* res = nullptr;
+        if (getpwuid_r(geteuid(), &pw, buf, sizeof buf, &res) == 0 && res)
+            owner = pw.pw_name;
+    }
+    std::string group = std::to_string(getegid());
+    {
+        char buf[1024];
+        struct group gr{};
+        struct group* res = nullptr;
+        if (getgrgid_r(getegid(), &gr, buf, sizeof buf, &res) == 0 && res)
+            group = gr.gr_name;
+    }
+
+    // plain list: paths only — no owner column, no detail fields at all
+    auto r = run(cli("list '" + arc.string() + "'"));
+    REQUIRE(r.code == 0);
+    CHECK(r.out == "src\nsrc/f.txt\n");
+    CHECK_FALSE(contains(r.out, owner + "/" + group));
+
+    // -v: tar-style "user/group" between the perms and the size
+    r = run(cli("list -v '" + arc.string() + "'"));
+    REQUIRE(r.code == 0);
+    CHECK(contains(r.out, owner + "/" + group));
+    CHECK(contains(r.out, "src/f.txt"));
 }
 
 TEST_CASE("cli: append adds entries, extraction takes newest", "[cli]") {
@@ -239,7 +289,7 @@ TEST_CASE("cli: tar-style top dir + -C + contents-only + multi-root", "[cli]") {
         const auto arc = td.path / "t1.arc";
         REQUIRE(run(cli("create -q '" + arc.string() + "' '" + (td.path / "proj").string() + "'")).code == 0);
         auto r = run(cli("list '" + arc.string() + "'"));
-        CHECK(contains(r.out, " proj\n")); // the top dir itself is an entry
+        CHECK(has_line(r.out, "proj")); // the top dir itself is an entry
         CHECK(contains(r.out, "proj/a.txt"));
         CHECK(contains(r.out, "proj/sub/b.txt"));
         const auto out = td.path / "out";

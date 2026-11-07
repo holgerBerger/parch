@@ -31,6 +31,9 @@
 #include <system_error>
 #include <vector>
 #include <ctime>
+#include <grp.h>
+#include <pwd.h>
+#include <unordered_map>
 
 namespace {
 
@@ -48,6 +51,7 @@ struct cli_opts {
     std::string directory;        // -C: chdir here before resolving any paths
     // ui
     spdlog::level::level_enum log_level = spdlog::level::info;
+    bool verbose = false;         // -v: debug logging + list owner/group column
 };
 
 [[noreturn]] void usage_error(const std::string& msg, int code = 2) {
@@ -73,7 +77,8 @@ struct cli_opts {
         "  -C, --directory DIR     chdir to DIR before anything: the archive path and all\n"
         "                          inputs resolve from there (like tar -C; e.g. store the\n"
         "                          contents of a dir without its name: -C DIR . )\n"
-        "  -v, --verbose           debug logging\n"
+        "  -v, --verbose           debug logging; list shows detailed rows incl. a\n"
+        "                          user/group column (plain list = paths only, like tar tf)\n"
         "  -q, --quiet             errors only\n"
         "      --version           print version and exit\n"
         "  -h, --help              this text\n");
@@ -112,7 +117,7 @@ std::vector<std::string> parse_args(int argc, char** argv, cli_opts& o) {
         else if (a == "--no-sync") o.durable = false;
         else if (a == "--no-sparse") o.sparse = false;
         else if (a == "-C" || a == "--directory") o.directory = need_value(i, "-C");
-        else if (a == "-v" || a == "--verbose") o.log_level = spdlog::level::debug;
+        else if (a == "-v" || a == "--verbose") { o.log_level = spdlog::level::debug; o.verbose = true; }
         else if (a == "-q" || a == "--quiet") o.log_level = spdlog::level::err;
         else if (a == "-h" || a == "--help") { usage_error("", 0); }
         else if (a == "--version") {
@@ -264,12 +269,43 @@ int cmd_write(bool append_mode, std::vector<std::string> args, const cli_opts& o
     return 0;
 }
 
+// -v owner/group column: passwd/group names when resolvable, raw numeric ids
+// otherwise (tar's behaviour for foreign uids). get*_r with a modest stack
+// buffer; ERANGE (name longer than buffer) falls back to numeric too. Results
+// are cached per id — ids repeat heavily across entries and NSS lookups are
+// exactly the network-FS round trips this project avoids elsewhere.
+std::string id_name(std::uint32_t id, bool is_user) {
+    static std::unordered_map<std::uint32_t, std::string> pw_cache, gr_cache;
+    auto& cache = is_user ? pw_cache : gr_cache;
+    if (const auto it = cache.find(id); it != cache.end()) return it->second;
+    std::string name = std::to_string(id);
+    char buf[1024];
+    if (is_user) {
+        struct passwd pw{};
+        struct passwd* res = nullptr;
+        if (getpwuid_r(id, &pw, buf, sizeof buf, &res) == 0 && res)
+            name = pw.pw_name;
+    } else {
+        struct group gr{};
+        struct group* res = nullptr;
+        if (getgrgid_r(id, &gr, buf, sizeof buf, &res) == 0 && res)
+            name = gr.gr_name;
+    }
+    cache.emplace(id, name);
+    return name;
+}
+
 int cmd_list(std::vector<std::string> args, const cli_opts& o) {
     if (args.size() != 1) usage_error("usage: arch list <archive>");
     arch::reader r(args.front(), arch::reader::options{});
     const auto entries = r.list();
 
     std::uint64_t total = 0;
+    if (!o.verbose) { // `tar tf` style: one stored path per line, nothing else
+        for (const auto& e : entries)
+            std::printf("%s\n", e.path.string().c_str());
+        return 0;
+    }
     for (const auto& e : entries) {
         char t = '-';
         switch (e.type) {
@@ -290,14 +326,16 @@ int cmd_list(std::vector<std::string> args, const cli_opts& o) {
         localtime_r(&tt, &tmv);
         std::strftime(when, sizeof when, "%Y-%m-%d %H:%M", &tmv);
         if (e.type == arch::format::file_type::regular) total += e.size;
-        std::printf("%c%s %8llu %s  %s%s%s\n", t, perms,
+        std::printf("%c%s", t, perms);
+        std::printf(" %s/%s", id_name(e.uid, true).c_str(),   // tar -lv style
+                    id_name(e.gid, false).c_str());
+        std::printf(" %8llu %s  %s%s%s\n",
                     static_cast<unsigned long long>(e.size), when,
                     e.path.string().c_str(),
                     e.link_target.empty() ? "" : " -> ", e.link_target.c_str());
     }
-    if (o.log_level <= spdlog::level::debug)
-        std::fprintf(stderr, "%zu entries, %s in regular files\n",
-                     entries.size(), human(total).c_str());
+    std::fprintf(stderr, "%zu entries, %s in regular files\n",
+                 entries.size(), human(total).c_str());
     return 0;
 }
 
