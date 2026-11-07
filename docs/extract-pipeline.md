@@ -342,3 +342,61 @@ to reproduce the aggregate-vs-single-stream gap. That plus a
 `--workload=hugefile` (single 8 GiB file) row would turn §4's "gate on
 measurement" into something measurable; a real Lustre/GPFS mount
 remains the only honest validation of B.
+
+### 7.5 Measurement protocol: what decides A vs B on a real Lustre mount
+
+Decision rule to instrument for: **B earns its ~800 LOC iff, after
+amended-A (§7.1), the residual restore time is dominated by
+single-stream-capped bytes** — i.e. blocks that sit in one file's
+sequential cursor while the OSTs idle. Everything below serves that one
+attribution.
+
+**Prerequisites (skip these and the comparison is invalid):**
+
+- **P0a. Archive stripe layout** (`lfs getstripe`): the archive must be
+  striped (`-c ≥` OST count); a `-c 1` archive is one disk's
+  bandwidth for *every* design, client-side included. Restripe or
+  re-create before measuring.
+- **P0b. Per-client RPC ceiling** (`osc_max_rpc_bytes`, ptlrpc pool
+  sizes): Lustre caps one client's in-flight RPC bytes independent of
+  thread count. If the cap sits at or below amended-A's natural
+  `depth × 4 MiB ≈ 128 MB`, stage R can buy nothing — the client is the
+  wall, not the design. Measure by driving fio `numjobs`/`iodepth`
+  until throughput flattens from one client only.
+
+**Filesystem characterization (design-independent, no arch code):**
+
+| # | quantity | method | feeds |
+|---|---|---|---|
+| M1 | metadata op latency **and aggregate ops/s**: create/open, chmod, chown, utimens, setxattr, link, unlink — cold (mdcache evicted) vs warm, single-directory vs spread, idle FS vs loaded | `mdtest`, or extend `netfs_delay`-style timing harness; `lfs df -w` (MDT count), DNE matters | the `depth` at which the MDS *saturates* — beyond it A's concurrency knob is free; below it, A's win is capped by MDS rate, and nothing else matters for small files |
+| M2 | bandwidth-vs-concurrency curve: sequential read of a striped file, `bs = 1–4 MiB`, `iodepth = 1…32`, `numjobs = 1…32`; same for buffered writes | `fio` (libaio) | the core curve: single-stream rate `r_1`, aggregate `r_agg`, and the in-flight MB needed to reach each — tells us exactly where A's `depth`-concurrent preads land and what B's stage R could add |
+| M3 | zstd-3 decode throughput per core on the *restore client* | `zstd -b3 -i5` | if `cores × decode < r_agg`, CPU is the binding wall — fixed by sizing A's decode permits, no B required |
+| M4 | page-cache cost of restore: dataset ≫ RAM, buffered vs `fadvise(DONTNEED)` vs O_DIRECT reads | A runs or fio | whether B's hygiene hooks (§7.2 bullet 3) are a real operational win, or noise |
+
+**Workload reality (from the actual archive sets, not benchmarks):**
+
+| # | quantity | method | feeds |
+|---|---|---|---|
+| W1 | byte-weighted file-size histogram; fraction of bytes in files whose single-stream read ≥ M2's `r_1`-limited band (files < ~`r_1 × 10 s`, say, are cursor-capped relative to `r_agg`) | `find -printf '%s'` | B's addressable byte fraction — if < 10 %, B is dead on arrival regardless of how good stage R is |
+| W2 | dir fan-out (files/dir) + hardlink rate + xattr/ACL presence | walk stats | MDS convoy exposure (§7.1 amendment 2 relevance) |
+
+**Amended-A run + residual attribution (the actual decider):**
+
+| # | quantity | method | verdict mapping |
+|---|---|---|---|
+| R1 | per-worker stage timers: time blocked in archive `pread`, in decode permit, in output `pwrite`, in open/setattr RTs | instrumented `arch_bench --op=extract` at `depth=32` | where restore minutes actually go |
+| R2 | achieved OST RPC concurrency + per-OST utilization during restore | `lctl`/per-OSC proc counters, `iostat` on OSSs | the discriminator: **OSTs idle while R1 shows workers serialized behind one file's cursor ⇒ B pays. OSTs at M2's aggregate ⇒ A+done. Decode cores at M3 ⇒ raise permits, not stages.** |
+| R3 | single-huge-file extract rate vs M2's `iodepth ≥ 8` line | one 8 GiB+ archive member | B's fan-out headroom in one number |
+
+**Decision arithmetic.** From M2 + W1, the counterfactual B-saving is
+`T_B = Σ_f bytes_f × (1/r_f^A − 1/r_f^agg)` over cursor-capped files.
+**Implement B iff `T_B` exceeds ~25 % of amended-A's measured total.**
+Below that, A + permit sizing + the §7.1 amendments is the whole
+program.
+
+**Portability caveat.** Absolute Lustre numbers never transfer between
+sites (MDS generation, DNE fan-out, spinner vs SSD OSTs, fabric). The
+transferable quantities are the *ratios*: `r_agg / r_1` from M2 (B's
+ceiling) and MDS-saturating `depth` from M1 (A's ceiling). A site that
+cannot run this protocol can still be triaged by supplying exactly
+those two curves.
