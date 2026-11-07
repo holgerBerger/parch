@@ -142,3 +142,15 @@ include(Catch)
 # ---------- tests ----------
 enable_testing()
 add_subdirectory(test)
+
+# ---------- Phase 9 benchmarks ----------
+# arch_bench: in-process writer/reader timing + memory profiling harness;
+# netfs_delay: LD_PRELOAD shim faking network-FS latency (see bench/*.c).
+enable_language(C)
+add_executable(arch_bench bench/bench.cpp)
+# --whole-archive for the REGISTER_COMPRESSOR static init (same as `arch`).
+target_link_libraries(arch_bench PRIVATE
+    "-Wl,--whole-archive" archiver_lib "-Wl,--no-whole-archive"
+    spdlog::spdlog)
+add_library(netfs_delay SHARED bench/netfs_delay.c)
+target_link_libraries(netfs_delay PRIVATE ${CMAKE_DL_LIBS})

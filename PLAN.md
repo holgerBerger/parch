@@ -74,6 +74,7 @@ compression and random per-file access. See `docs/format.md` for the full spec
 | Tests (Catch2) | ✅ **89/89 passing** (default) / **95/95** (`ARCH_WITH_URING=ON`) — includes `test/test_pipeline.cpp` (ordered multi-block delivery, errors, empty files, backpressure bounds, dtor-during-inflight, writer recovery + serial/pipeline byte-identity) and `test/test_reader.cpp` (list roundtrip, extract_all byte-compare + links/xattr/mode/times, data/metadata/footer corruption detection, truncation-point drop, `writer::append` two-section/empty/sticky-DEDUP, dedup + pipelined roundtrips, zip-slip unit tests) and `test/test_cli.cpp` (5 subprocess cases: roundtrip, append-wins, store mode + knobs, error codes/exit statuses, options anywhere) `test/test_xattr.cpp` `[acl]` cases (trivial-skip, util blob roundtrip, archive→extract ACL equality incl. default ACLs), and `test/test_sparse.cpp` (14 cases: hole roundtrips pipeline+serial, trailing-hole ftruncate restore, partial-hole guard, v0.2/v0.3 footer flip + `options.sparse=false`, hole↔zero dedup under store mode, append v0.3 stickiness, sparse helper equivalence, `retry_io` backoff/EINTR/cap semantics, `verify_all` by-name reporting + hardlink dup). |
 | CLI (`src/main.cpp`) | ✅ **Done (Phase 5)** — `create`/`append`/`list`/`extract`/`verify` with codec/level/threads/depth/dedup/durability/sparse flags; stderr diagnostics, stdout listings, exit codes 0/1/2; links the static lib with `--whole-archive` (compressor registration); `test/test_cli.cpp` covers roundtrips + error codes end-to-end |
 | Test plan (`docs/testing.md`) | ✅ Complete — 50+ planned future tests with priorities |
+| Benchmarks + memory profile (`docs/benchmarks.md`) | ✅ **Done (Phase 9)** — `bench/bench.cpp` (`arch_bench`) + `bench/netfs_delay.c` (LD_PRELOAD 500 µs open+first-read latency shim) + `bench/run_bench.sh` matrix; vs GNU tar 1.35 `--zstd -3`. Headline: pipeline create **28×** faster than tar/serial on many-small-files under simulated netfs latency (97.7 vs 3.5 MiB/s); extract beats tar on every workload (1.3–2.4×); writer RSS 50/97/214 MiB at `-j 1/4/12` (plateau at `-j 4`); dedup index measured ~0.14 KiB/entry ⇒ ~36 GiB/PiB unique (freed per `finalize_section()`, no spill index in v1). |
 
 ## Archive format (summary)
 
@@ -145,7 +146,7 @@ docs/
 
 ## Remaining work (ordered)
 
-> **Phases 0–5, 7, 8 ✅ (2026-11):** the project configures, compiles, and tests
+> **Phases 0–5, 7–9 ✅ (2026-11):** the project configures, compiles, and tests
 > green (89/89 default, 95/95 `-DARCH_WITH_URING=ON`); docs, `format.h`, and
 > tests are on the frozen v0.2 layout; the writer *streams* spec-conformant
 > archives (TOC/footer serialization, dedup, `add_tree`) verified by an
@@ -160,8 +161,11 @@ docs/
 > archive→extract roundtrip-tested; and **Phase 8** made sparse files native
 > (v0.3 `COMPRESSOR_SPARSE` blocks — holes never read or written), added
 > transient-error retry with backoff on the hot syscalls, and a full data
-> `verify` pass (`reader::verify_all()` / `arch verify`).
-> Remaining: Phase 9 (benchmarks + memory profiling) only.
+> `verify` pass (`reader::verify_all()` / `arch verify`); and **Phase 9**
+> benchmarked the result against GNU tar (28× create win on many small
+> files under simulated netfs latency; extract faster than tar on every
+> workload) and documented the memory profile (`docs/benchmarks.md`).
+> Remaining: **none** — all PLAN.md phases are done; v1 feature-complete.
 >
 > **Design decisions frozen (2026-11):** io_uring demoted to an optional
 > backend (`ARCH_WITH_URING`, default OFF) — the primary I/O path is a
@@ -431,13 +435,29 @@ block CRCs + decompress roundtrip, dedup single-store, tree relative paths).
     block-read loop, and the reader's `read_at`. `retry_sleep_count()` is a
     process-wide test hook proving the path ran without real latency.
 
-### Phase 9: Performance
-32. **Benchmark suite** — throughput on local SSD, NFS (simulated latency),
-    SMB; compare against `tar --zstd` and `bsdtar -z`. Include a many-small-
-    files workload — that is the pipeline's reason to exist.
-33. **Memory profiling** — per-thread zstd context reuse, pipeline buffer
-    pool sizing, dedup index RAM cost (≈ 16 GB per PiB unique data at 4 MiB
-    blocks — document and consider an on-disk spill index).
+### Phase 9: Performance — ✅ DONE (2026-11)
+32. ✅ **Benchmark suite** — `bench/bench.cpp` (`arch_bench`, wired into
+    CMake; machine-readable `key=value` result lines, exact child RSS via
+    `wait4` rusage) + `bench/netfs_delay.c` (`libnetfs_delay.so`, an
+    LD_PRELOAD shim charging 500 µs per open + first read under
+    `NETFS_PREFIX` — incl. FORTIFY `__open_2` variants and relative dirfd
+    paths resolved through `/proc`) + `bench/run_bench.sh` (full matrix).
+    Three workloads (20k×4 KiB small-files / mixed 569 MiB / big 1 GiB)
+    vs GNU tar 1.35 `--zstd -3` (bsdtar absent on this machine).
+    Headline (`docs/benchmarks.md`): on the simulated netfs, pipeline
+    create is **28× faster** than tar *and* than the serial path
+    (97.7 vs 3.5 MiB/s); locally arch create is 0.6–0.7× of tar but
+    **extract beats tar on every workload** (1.3–2.4×, block-parallel
+    decompression); depth is a latency knob (local peak at 4).
+33. ✅ **Memory profiling** — documented in `docs/benchmarks.md` §4:
+    writer peak RSS 50/97/214 MiB at `-j 1/4/12` (ceiling ≈
+    `block_permits` × 4 MiB, throughput plateaus at `-j 4` ⇒ recommended);
+    zstd `ZSTD_CCtx` created once per worker and reused for every block
+    (~1.2 MB/worker, independent of data size); dedup index measured at
+    **~0.14 KiB/entry ⇒ ~36 GiB per PiB unique** (worse than the 16 GB
+    estimate, which ignored `unordered_map` overhead) — per-section and
+    freed at `finalize_section()`, so the on-disk spill index is
+    deliberately **not built** for v1.
 
 > Removed from roadmap: **dedup cross-section** (frozen decision — TOC
 > sections stay self-contained) and **per-file zstd multithreading** as a

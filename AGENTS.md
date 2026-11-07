@@ -10,11 +10,12 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-- **Builds green (2026-11, Phases 0–5, 7, 8 done):** 89/89 tests default; 95/95 with `-DARCH_WITH_URING=ON`. The policy flag is set inside CMakeLists (`CMAKE_POLICY_VERSION_MINIMUM`), not required on the command line anymore.
+- **Builds green (2026-11, Phases 0–5, 7–9 done):** 89/89 tests default; 95/95 with `-DARCH_WITH_URING=ON`. The policy flag is set inside CMakeLists (`CMAKE_POLICY_VERSION_MINIMUM`), not required on the command line anymore.
 - CMake 3.22+, C++20 compiler. Note: GCC 15 rejects `opts = {}` default arguments for nested classes with only implicit ctors — `writer::options` has an explicit `options() {}` for this; don't remove it. Default build is plain POSIX — **liburing is NOT required**.
 - io_uring backend is opt-in: `-DARCH_WITH_URING=ON` (needs `liburing-devel`/`liburing-dev` via pkg-config) and pulls in `src/io/io_uring_pool.cpp`, `src/io/prefetch.cpp` + their tests.
 - **libacl is a required system dep** (`pkg_check_modules(LIBACL REQUIRED ...)`) for the ACL capture/restore in `src/util/xattr.cpp` (Phase 7). All other deps (spdlog, zstd, crc32c, xxHash) are fetched via FetchContent — no manual install needed.
 - Tests: single binary `arch_test` driven by Catch2 v3 + `catch_discover_tests()`. Tags like `[slow]` mark heavy tests.
+- Benchmarks (Phase 9): `cmake --build build --target arch_bench netfs_delay`, then `bench/run_bench.sh` (matrix; env `DATA=<dir>`, results are `key=value` lines — see `docs/benchmarks.md`). `arch_bench` needs the same `--whole-archive` treatment as `arch`.
 
 ## Code Layout
 
@@ -29,7 +30,10 @@ src/io/              — pipeline.cpp (Phase 3, always built), sparse.h (Phase 8
                        io_uring pool + prefetcher (ARCH_WITH_URING only)
 src/util/            — xattr implementation, retry.h (transient-error backoff, header-only)
 test/                — Catch2 tests (one file per subsystem; io_uring tests gated on ARCH_WITH_URING)
-docs/                — format spec, test plan, API reference
+bench/               — Phase 9: bench.cpp (`arch_bench` in-process timing + RSS harness,
+                       key=value result lines), netfs_delay.c (`libnetfs_delay.so`
+                       LD_PRELOAD latency shim), run_bench.sh (full matrix)
+docs/                — format spec, test plan, API reference, benchmarks.md (Phase 9 results)
 ```
 
 `src/main.cpp` is the `arch` CLI (Phase 5): `create` / `append` / `list` /
@@ -77,6 +81,15 @@ for the `REGISTER_COMPRESSOR` static init (see linking note below).
 - `crc32c::Crc32c(nullptr, 0)` is ambiguous — use `crc32c::Extend(0, nullptr, 0)` for the CRC of zero bytes.
 - `retry_io` returns partial results (`0 <= r < want`) to the caller to re-loop; do not treat partial as failure. `retry_io(op)` on permanent failure leaves the final errno in `errno` after return.
 - `writer::append()` on a v0.3 archive **inherits** `used_sparse` (footer version ≥ 0x0003) so the rewritten footer keeps advertising v0.3 even when the appended section is dense.
+
+### Phase 9 gotchas (benchmarks / latency shim)
+- **FORTIFY defeats `open` interposition**: GCC Release builds rewrite two-arg `open(p, O_RDONLY)` into `__open_2` (and `openat` → `__openat_2`), which bypasses a plain `open` shim entirely — `netfs_delay.c` must export `__open_2/__open64_2/__openat_2/__openat64_2` too, or the parent process sees zero injected latency (check with `nm -U <obj> | grep open`).
+- **Relative-path opens**: tar-style `openat(dirfd, "name", …)` never matches `NETFS_PREFIX` directly; resolve dirfd via `/proc/self/fd/N` (cwd for `AT_FDCWD`) and re-check the prefix.
+- `getrusage(RUSAGE_CHILDREN).ru_maxrss` is an **all-time high-water across every past child** — cross-contaminates sequential tar runs. `bench.cpp::run_child` uses `wait4(pid, …, &rusage)` for exact per-child numbers.
+- Self-process `ru_maxrss` is monotonic for the whole process: an `--op=all` run reports the same peak for create/extract/verify — read the delta between runs, not the per-op column.
+- **Never edit a bash script while it is running** (byte-offset shift corrupts mid-stream parsing — cost a full matrix rerun).
+- All timings are **warm page cache** (no root for `drop_caches`); documented as methodology in `docs/benchmarks.md`.
+- Bench data lives in `$HOME/benchdata` (override `DATA=`); reuse with `--no-gen` (generation of `small` alone is ~20k file creations).
 
 ### `writer.cpp` — serialization notes (Phase 2 done)
 - **Section layout**: `ensure_section()` reserves a zeroed 128-byte `toc_header` at `file_end`; blocks are `pwrite`d live at `section_start + 128 + data_written`; `finalize_section()` appends the serialized tables and patches the header in place. `block_entry.offset` is **section-relative** (frozen convention); `data_offset` is always `TOC_HEADER_SIZE`.
@@ -139,4 +152,4 @@ for the `REGISTER_COMPRESSOR` static init (see linking note below).
 - Tests use `mkstemp` for temp files (not Catch2's file helpers).
 
 ## Phase Checklist (current status)
-See PLAN.md for full status. In short: **Phases 0–5, 7, 8 ✅** (builds green; `format.h` on v0.3-minimal (v0.2 layouts + `COMPRESSOR_SPARSE`); writer streams + serializes spec-conformant archives with pipelined `add_tree`; reader parses/validates/extracts in a parallel wave pipeline with corruption + truncation-tolerance semantics; `writer::append()` static factory works and is covered by two-section roundtrip tests — 89/89 default, 95/95 `ARCH_WITH_URING=ON`; reader is ASan/UBSan-clean and TSan-clean); CLI ✅ (`arch create/append/list/extract/verify`, subprocess-tested, ASan-clean via `[cli]` tests); ACL roundtrip ✅ (libacl, access + default ACLs archived and restored, `[acl]` tests); sparse files + retry + verify ✅ (Phase 8, `test/test_sparse.cpp` 14 cases, ASan/UBSan/TSan-clean). Remaining: Phase 9 (benchmarks).
+See PLAN.md for full status. In short: **Phases 0–5, 7–9 ✅** (builds green; `format.h` on v0.3-minimal (v0.2 layouts + `COMPRESSOR_SPARSE`); writer streams + serializes spec-conformant archives with pipelined `add_tree`; reader parses/validates/extracts in a parallel wave pipeline with corruption + truncation-tolerance semantics; `writer::append()` static factory works and is covered by two-section roundtrip tests — 89/89 default, 95/95 `ARCH_WITH_URING=ON`; reader is ASan/UBSan-clean and TSan-clean); CLI ✅ (`arch create/append/list/extract/verify`, subprocess-tested, ASan-clean via `[cli]` tests); ACL roundtrip ✅ (libacl, access + default ACLs archived and restored, `[acl]` tests); sparse files + retry + verify ✅ (Phase 8, `test/test_sparse.cpp` 14 cases, ASan/UBSan/TSan-clean); benchmarks + memory profile ✅ (Phase 9, `bench/` + `docs/benchmarks.md` — 28× pipeline create win under simulated netfs latency, extract beats tar everywhere, dedup RAM 36 GiB/PiB). **All phases complete — v1 feature-freeze.**

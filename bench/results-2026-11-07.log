@@ -1,0 +1,71 @@
+
+# ---------------------------------------------------------------------------
+# 0. workload generation
+
+gen workload=small files=20000 bytes=81920000
+gen workload=mixed files=2250 bytes=596186624
+gen workload=big files=2 bytes=1073741824
+
+# ---------------------------------------------------------------------------
+# 1. local NVMe (warm): tar --zstd -3 / tar store vs arch create -c zstd -l3 / extract / verify
+
+tool=tar-zstd workload=small op=create threads=4 depth=32 compressor=zstd dedup=0 in_bytes=81920000 out_bytes=15242114 secs=0.089 rate_mibs=876.7 maxrss_kib=70120 minflt=1
+tool=tar-zstd workload=small op=extract threads=4 depth=32 compressor=zstd dedup=0 in_bytes=81920000 out_bytes=0 secs=0.179 rate_mibs=436.6 maxrss_kib=70120 minflt=0
+tool=tar-store workload=small op=create threads=4 depth=32 compressor=zstd dedup=0 in_bytes=81920000 out_bytes=92180480 secs=0.090 rate_mibs=870.4 maxrss_kib=70120 minflt=0
+tool=arch workload=small op=create threads=4 depth=32 compressor=zstd dedup=0 in_bytes=81920000 out_bytes=22090050 secs=0.750 rate_mibs=104.2 maxrss_kib=70120 minflt=8789
+tool=arch workload=small op=extract threads=4 depth=32 compressor=zstd dedup=0 in_bytes=81920000 out_bytes=0 secs=0.117 rate_mibs=665.1 maxrss_kib=70120 minflt=437
+tool=arch workload=small op=verify threads=4 depth=32 compressor=zstd dedup=0 in_bytes=81920000 out_bytes=0 secs=0.100 rate_mibs=779.6 maxrss_kib=70120 minflt=0 errors=0
+tool=tar-zstd workload=mixed op=create threads=4 depth=32 compressor=zstd dedup=0 in_bytes=596186624 out_bytes=315003185 secs=0.339 rate_mibs=1675.7 maxrss_kib=117312 minflt=1
+tool=tar-zstd workload=mixed op=extract threads=4 depth=32 compressor=zstd dedup=0 in_bytes=596186624 out_bytes=0 secs=0.282 rate_mibs=2019.7 maxrss_kib=117312 minflt=0
+tool=tar-store workload=mixed op=create threads=4 depth=32 compressor=zstd dedup=0 in_bytes=596186624 out_bytes=597350400 secs=0.291 rate_mibs=1954.3 maxrss_kib=117312 minflt=0
+tool=arch workload=mixed op=create threads=4 depth=32 compressor=zstd dedup=0 in_bytes=596186624 out_bytes=315649075 secs=0.505 rate_mibs=1124.8 maxrss_kib=444812 minflt=185823
+tool=arch workload=mixed op=extract threads=4 depth=32 compressor=zstd dedup=0 in_bytes=596186624 out_bytes=0 secs=0.117 rate_mibs=4847.3 maxrss_kib=444812 minflt=6997
+tool=arch workload=mixed op=verify threads=4 depth=32 compressor=zstd dedup=0 in_bytes=596186624 out_bytes=0 secs=0.231 rate_mibs=2459.5 maxrss_kib=444812 minflt=101576 errors=0
+tool=tar-zstd workload=big op=create threads=4 depth=32 compressor=zstd dedup=0 in_bytes=1073741824 out_bytes=633962201 secs=0.602 rate_mibs=1701.4 maxrss_kib=107748 minflt=1
+tool=tar-zstd workload=big op=extract threads=4 depth=32 compressor=zstd dedup=0 in_bytes=1073741824 out_bytes=0 secs=0.425 rate_mibs=2407.3 maxrss_kib=107748 minflt=0
+tool=tar-store workload=big op=create threads=4 depth=32 compressor=zstd dedup=0 in_bytes=1073741824 out_bytes=1073745920 secs=0.563 rate_mibs=1819.0 maxrss_kib=107748 minflt=0
+tool=arch workload=big op=create threads=4 depth=32 compressor=zstd dedup=0 in_bytes=1073741824 out_bytes=633962589 secs=0.838 rate_mibs=1221.3 maxrss_kib=107748 minflt=31977
+tool=arch workload=big op=extract threads=4 depth=32 compressor=zstd dedup=0 in_bytes=1073741824 out_bytes=0 secs=0.324 rate_mibs=3159.4 maxrss_kib=107748 minflt=259745
+tool=arch workload=big op=verify threads=4 depth=32 compressor=zstd dedup=0 in_bytes=1073741824 out_bytes=0 secs=0.413 rate_mibs=2480.7 maxrss_kib=107748 minflt=258587 errors=0
+
+# ---------------------------------------------------------------------------
+# 2. pipeline depth scaling (small workload, 20k files, no latency)
+
+tool=arch workload=small op=create threads=4 depth=1 compressor=zstd dedup=0 in_bytes=81920000 out_bytes=22090050 secs=0.625 rate_mibs=125.1 maxrss_kib=26392 minflt=8304
+tool=arch workload=small op=create threads=4 depth=2 compressor=zstd dedup=0 in_bytes=81920000 out_bytes=22090050 secs=0.441 rate_mibs=177.1 maxrss_kib=26532 minflt=8317
+tool=arch workload=small op=create threads=4 depth=4 compressor=zstd dedup=0 in_bytes=81920000 out_bytes=22090050 secs=0.285 rate_mibs=274.3 maxrss_kib=26576 minflt=8337
+tool=arch workload=small op=create threads=4 depth=8 compressor=zstd dedup=0 in_bytes=81920000 out_bytes=22090050 secs=0.297 rate_mibs=263.4 maxrss_kib=27092 minflt=8371
+tool=arch workload=small op=create threads=4 depth=16 compressor=zstd dedup=0 in_bytes=81920000 out_bytes=22090050 secs=0.488 rate_mibs=160.0 maxrss_kib=27024 minflt=8668
+tool=arch workload=small op=create threads=4 depth=32 compressor=zstd dedup=0 in_bytes=81920000 out_bytes=22090050 secs=0.718 rate_mibs=108.8 maxrss_kib=27212 minflt=8795
+tool=arch workload=small op=create threads=4 depth=64 compressor=zstd dedup=0 in_bytes=81920000 out_bytes=22090050 secs=1.116 rate_mibs=70.0 maxrss_kib=28500 minflt=8805
+
+# ---------------------------------------------------------------------------
+# 3. simulated network FS (LD_PRELOAD: 500 us per open + first read)
+
+tool=tar-zstd workload=small op=create threads=4 depth=1 compressor=zstd dedup=0 in_bytes=81920000 out_bytes=15242114 secs=22.171 rate_mibs=3.5 maxrss_kib=63900 minflt=0
+tool=tar-zstd workload=small op=extract threads=4 depth=1 compressor=zstd dedup=0 in_bytes=81920000 out_bytes=0 secs=11.277 rate_mibs=6.9 maxrss_kib=63900 minflt=0
+tool=tar-store workload=small op=create threads=4 depth=1 compressor=zstd dedup=0 in_bytes=81920000 out_bytes=92180480 secs=22.187 rate_mibs=3.5 maxrss_kib=63900 minflt=0
+tool=arch workload=small op=create threads=4 depth=1 compressor=zstd dedup=0 in_bytes=81920000 out_bytes=22090050 secs=22.945 rate_mibs=3.4 maxrss_kib=63900 minflt=8295
+tool=tar-zstd workload=small op=create threads=4 depth=32 compressor=zstd dedup=0 in_bytes=81920000 out_bytes=15242114 secs=22.231 rate_mibs=3.5 maxrss_kib=64056 minflt=0
+tool=tar-zstd workload=small op=extract threads=4 depth=32 compressor=zstd dedup=0 in_bytes=81920000 out_bytes=0 secs=11.284 rate_mibs=6.9 maxrss_kib=64056 minflt=0
+tool=tar-store workload=small op=create threads=4 depth=32 compressor=zstd dedup=0 in_bytes=81920000 out_bytes=92180480 secs=22.199 rate_mibs=3.5 maxrss_kib=64056 minflt=0
+tool=arch workload=small op=create threads=4 depth=32 compressor=zstd dedup=0 in_bytes=81920000 out_bytes=22090050 secs=0.800 rate_mibs=97.7 maxrss_kib=64056 minflt=8822
+tool=arch workload=small op=extract threads=4 depth=32 compressor=zstd dedup=0 in_bytes=81920000 out_bytes=0 secs=5.619 rate_mibs=13.9 maxrss_kib=13868 minflt=3600
+
+# ---------------------------------------------------------------------------
+# 4. memory profiling: writer threads sweep (big workload, 1 GiB, 4 MiB blocks)
+
+tool=arch workload=big op=create threads=1 depth=32 compressor=zstd dedup=0 in_bytes=1073741824 out_bytes=633962589 secs=1.232 rate_mibs=831.3 maxrss_kib=51508 minflt=16783
+tool=arch workload=big op=create threads=4 depth=32 compressor=zstd dedup=0 in_bytes=1073741824 out_bytes=633962589 secs=0.803 rate_mibs=1275.2 maxrss_kib=99616 minflt=31978
+tool=arch workload=big op=create threads=12 depth=32 compressor=zstd dedup=0 in_bytes=1073741824 out_bytes=633962589 secs=0.834 rate_mibs=1228.1 maxrss_kib=219132 minflt=61886
+
+# ---------------------------------------------------------------------------
+# 5. memory profiling: dedup on/off at data scale + per-entry container cost
+
+tool=arch workload=big op=create threads=4 depth=32 compressor=zstd dedup=0 in_bytes=1073741824 out_bytes=633962589 secs=0.803 rate_mibs=1275.8 maxrss_kib=99752 minflt=31977
+tool=arch workload=big op=create threads=4 depth=32 compressor=zstd dedup=1 in_bytes=1073741824 out_bytes=633970781 secs=0.829 rate_mibs=1235.4 maxrss_kib=95696 minflt=30969
+tool=arch workload=- op=dedupram entries=2000000 rss_delta_kib=282452 kib_per_entry=0.14 gib_per_pib_unique=36.2
+
+# ---------------------------------------------------------------------------
+# done
+
