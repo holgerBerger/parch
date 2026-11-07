@@ -711,7 +711,7 @@ TEST_CASE("reader profile report: contents and hints", "[reader][phase10][profil
         CHECK(read_file(out / rel) == d);
     const auto rep = r.profile_report();
     CHECK_FALSE(rep.empty());
-    CHECK(rep.find("arch profile:") != std::string::npos);
+    CHECK(rep.find("parch profile:") != std::string::npos);
     CHECK(rep.find("worker utilization") != std::string::npos);
     for (const char* stage : {"archive read", "crc32c", "decompress", "write out",
                               "create+open", "metadata"})

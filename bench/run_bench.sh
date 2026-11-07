@@ -20,7 +20,7 @@ sec() { echo; echo "# ----------------------------------------------------------
 sec "0. workload generation"
 for w in small mixed big; do "$B" --workload=$w --op=gen $C; done
 
-sec "1. local NVMe (warm): tar --zstd -3 / tar store vs arch create -c zstd -l3 / extract / verify"
+sec "1. local NVMe (warm): tar --zstd -3 / tar store vs parch create -c zstd -l3 / extract / verify"
 for w in small mixed big; do
     "$B" --workload=$w --op=all --no-gen $C --threads=4 --depth=32
 done

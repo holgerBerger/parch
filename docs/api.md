@@ -8,7 +8,7 @@ The archiver library exposes three layers:
 2. **Format types** — on-disk layout constants and in-memory structs (`include/arch/format.h`)
 3. **Internal API** — low-level I/O, compression, utilities (not public; may change)
 
-The `arch` command-line tool (`src/main.cpp`, section 8) is the reference
+The `parch` command-line tool (`src/main.cpp`, section 8) is the reference
 consumer of the public API.
 
 ---
@@ -615,19 +615,19 @@ writer's reserved store-mode keyword. The real google/crc32c entry points are
 
 ---
 
-## 8. Command-line tool (`arch`)
+## 8. Command-line tool (`parch`)
 
-**Source:** `src/main.cpp` — built as the `arch` target. All diagnostics and
+**Source:** `src/main.cpp` — built as the `parch` target. All diagnostics and
 progress go to **stderr** (spdlog, colored); `list` rows go to **stdout** so
 they are pipeable. Exit codes: `0` success, `1` runtime/ I/O error, `2` usage
 error. Options may appear before *or* after the command word.
 
 ```
-usage: arch create  [opts] <archive> <tree|file...>
-       arch append  [opts] <archive> <tree|file...>
-       arch list    [opts] <archive>
-       arch extract [opts] <archive> [dest]      (dest default: .)
-       arch verify  [opts] <archive>             (check all block + file CRCs)
+usage: parch create  [opts] <archive> <tree|file...>
+       parch append  [opts] <archive> <tree|file...>
+       parch list    [opts] <archive>
+       parch extract [opts] <archive> [dest]      (dest default: .)
+       parch verify  [opts] <archive>             (check all block + file CRCs)
 
 opts:
   -c, --compressor NAME   zstd (default) or none (store)
@@ -655,10 +655,10 @@ opts:
   the create report is printed by `finalize()`. **Directory** arguments are
   stored tar-style via `add_tree(name, prefix)`: the directory's own final
   path component becomes the entry prefix, including a top-level directory
-  entry (`arch create a.arc dir` stores `dir`, `dir/a.txt`, …; a trailing
+  entry (`parch create a.arc dir` stores `dir`, `dir/a.txt`, …; a trailing
   slash makes no difference; `..` resolves to the parent's real name). A
   final `.` component stores **only the contents** (the old behavior):
-  `arch create a.arc -C dir .`. Plain **file** arguments go through
+  `parch create a.arc -C dir .`. Plain **file** arguments go through
   `add_file` and are stored by their basename (same-basename files from
   different directories collide, like `tar` without leading dirs). `-C`
   chdirs before anything else, so the **archive path is resolved from it
@@ -678,7 +678,7 @@ opts:
 - `--no-sparse` clears `writer::options.sparse` (holes stored densely, archive
   stays format v0.2).
 
-**Linking note:** the `arch` target wraps `archiver_lib` in a literal
+**Linking note:** the `parch` target wraps `archiver_lib` in a literal
 `-Wl,--whole-archive ... -Wl,--no-whole-archive` pair inside
 `target_link_libraries` so the `REGISTER_COMPRESSOR` static initializers
 survive linking against the static library.

@@ -23,7 +23,7 @@ Workloads (deterministic, `--workload=…`):
 - `big` — two 512 MiB files (one text, one random, 1 GiB): block-path
   throughput only.
 
-`arch` runs use the in-process writer/reader API with
+`parch` runs use the in-process writer/reader API with
 `-c zstd -l 3 -j 4 --depth 32` unless noted. The tar comparison uses
 `tar --zstd` with `ZSTD_CLEVEL=3`; GNU tar shells out to the
 single-threaded `zstd` binary, so its per-MiB rate benefits from one big
@@ -72,7 +72,7 @@ Reading the table:
 
 ## 2. Pipeline depth scaling (20k small files, no injected latency)
 
-`arch create`, threads=4, zstd-3:
+`parch create`, threads=4, zstd-3:
 
 | depth | 1 | 2 | 4 | 8 | 16 | 32 | 64 |
 |---|---|---|---|---|---|---|---|
@@ -85,10 +85,10 @@ scheduling churn (and on this 4 KiB-file workload the I/O threads race
 ahead of the 4 compression workers, growing queue handoffs). Default 32
 looks conservative here — it is tuned for §3, where it is worth ~28×.
 
-### 2.1 `arch create --profile` (writer-side, 2026-11 follow-up)
+### 2.1 `parch create --profile` (writer-side, 2026-11 follow-up)
 
 The same stage profiler the reader got in Phase 10 now exists for
-create/append (`writer::options.profile`, `arch create/append
+create/append (`writer::options.profile`, `parch create/append
 --profile`). It attributes time across source open / xattr / pread / CRC
 / XXH3 / compress / permit-wait / tree walk / writer wait / archive
 write / dedup lookup / TOC+fsync and prints tuning hints. Verified
@@ -107,7 +107,7 @@ Archive bytes are identical with profiling on/off (asserted by
 `__open_2` variants and relative dirfd paths resolved through
 `/proc/self/fd`) and the **first** `pread`/`read` per fd sleep 500 µs —
 one open RT + one read RT per file, like NFS. Applied identically to
-`arch` (in-process) and `tar` (forked child inherits the preload).
+`parch` (in-process) and `tar` (forked child inherits the preload).
 Workload: `small` (20 000 files, 80 MiB).
 
 | tool / config | create | extract |
@@ -186,7 +186,7 @@ out-of-permit reads).
 
 ### Writer buffer pool (`block_permits`)
 
-`arch create`, `big` (1 GiB, 4 MiB blocks), depth=32, zstd-3:
+`parch create`, `big` (1 GiB, 4 MiB blocks), depth=32, zstd-3:
 
 | threads (-j) | 1 | 4 | 12 |
 |---|---|---|---|

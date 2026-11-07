@@ -116,13 +116,15 @@ target_compile_options(archiver_lib PRIVATE
 )
 
 # ---------- CLI tool ----------
-add_executable(arch src/main.cpp)
-target_compile_definitions(arch PRIVATE ARCH_CLI_VERSION="${PROJECT_VERSION}")
+# Binary is `parch` ("parallel archiver") — the name advertises the
+# cross-file worker pipeline that is the whole point on network filesystems.
+add_executable(parch src/main.cpp)
+target_compile_definitions(parch PRIVATE ARCH_CLI_VERSION="${PROJECT_VERSION}")
 # --whole-archive: REGISTER_COMPRESSOR relies on static initializers inside
 # zstd_impl.o, which the linker would otherwise drop from the static lib
 # (AGENTS.md linking note). Literal items in target_link_libraries keep their
 # order, so the flag pair wraps exactly archiver_lib.
-target_link_libraries(arch PRIVATE
+target_link_libraries(parch PRIVATE
     "-Wl,--whole-archive" archiver_lib "-Wl,--no-whole-archive"
     spdlog::spdlog)
 
@@ -148,7 +150,7 @@ add_subdirectory(test)
 # netfs_delay: LD_PRELOAD shim faking network-FS latency (see bench/*.c).
 enable_language(C)
 add_executable(arch_bench bench/bench.cpp)
-# --whole-archive for the REGISTER_COMPRESSOR static init (same as `arch`).
+# --whole-archive for the REGISTER_COMPRESSOR static init (same as `parch`).
 target_link_libraries(arch_bench PRIVATE
     "-Wl,--whole-archive" archiver_lib "-Wl,--no-whole-archive"
     spdlog::spdlog)

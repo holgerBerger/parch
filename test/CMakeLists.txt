@@ -27,10 +27,10 @@ endif()
 
 add_executable(arch_test ${ARCH_TEST_SOURCES})
 
-# test_cli.cpp runs the `arch` binary as a subprocess.
+# test_cli.cpp runs the `parch` binary as a subprocess.
 target_compile_definitions(arch_test PRIVATE
-    ARCH_CLI_BINARY="$<TARGET_FILE:arch>")
-add_dependencies(arch_test arch)
+    ARCH_CLI_BINARY="$<TARGET_FILE:parch>")
+add_dependencies(arch_test parch)
 
 target_link_libraries(arch_test PRIVATE
     archiver_lib

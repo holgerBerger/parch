@@ -163,13 +163,13 @@ TEST_CASE("writer profile: report contents, counters, byte-identity", "[writer][
     }
 
     CHECK_FALSE(rep.empty());
-    CHECK(rep.find("arch create profile:") != std::string::npos);
+    CHECK(rep.find("parch create profile:") != std::string::npos);
     CHECK(rep.find("15 files") != std::string::npos); // 12 small + 3 dup copies
     CHECK(rep.find("compress") != std::string::npos);
     CHECK(rep.find("source read") != std::string::npos);
     CHECK(rep.find("tree walk") != std::string::npos);
     CHECK(rep.find("dedup 2 hits") != std::string::npos); // 3rd copy stored, 2 hits
-    CHECK(rep.find("arch create hint:") != std::string::npos);
+    CHECK(rep.find("parch create hint:") != std::string::npos);
 
     // Profiling must not change the bytes on disk.
     CHECK(slurp(arc_on) == slurp(arc_off));
@@ -189,7 +189,7 @@ TEST_CASE("writer profile: serial fallback reports into the same stages", "[writ
     w.finalize();
     const auto rep = w.profile_report();
     CHECK_FALSE(rep.empty());
-    CHECK(rep.find("arch create profile:") != std::string::npos);
+    CHECK(rep.find("parch create profile:") != std::string::npos);
     CHECK(rep.find("source read") != std::string::npos);
     CHECK(rep.find("compress") != std::string::npos);
     CHECK(rep.find("dedup 2 hits") != std::string::npos);

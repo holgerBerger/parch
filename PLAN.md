@@ -71,7 +71,7 @@ compression and random per-file access. See `docs/format.md` for the full spec
 | Xattr/ACL util (`src/util/xattr.cpp`) | ✅ **Done (Phase 7)** — `read_xattrs`/`write_xattrs` via `listxattr`/`getxattr`/`setxattr` (binary blob per spec, `system.posix_acl_*` skipped); `read_acl`/`write_acl` on libacl (access + default ACLs, numeric IDs, mask handled); restore failures on ACL-less filesystems log instead of throwing. |
 | CMake (FetchContent) | ✅ Configures & builds from scratch: policy-version workaround for crc32c, Catch2 `extras/` module path + `include(Catch)`, `spdlog::spdlog` target, `SOURCE_SUBDIR` for zstd (`build/cmake`) and xxHash (`cmake_unofficial`), `option(ARCH_WITH_URING OFF)` gating pool/prefetch sources + tests. |
 | Sparse files (`src/io/sparse.h`) | ✅ **Done (Phase 8)** — `SEEK_DATA` hole detection (gated on `st_blocks*512 < st_size`), whole-hole blocks stored as `COMPRESSOR_SPARSE` (zero bytes, format flips to v0.3 only when used, sticky across `append`); hole `content_id` = XXH3-128 of zeros so dense-zero blocks dedup against holes; extraction leaves holes and `ftruncate`s trailing ones. Pipeline + serial paths both honoured. ASan/UBSan/TSan-clean. |
-| Retry + verify (Phase 8) | ✅ **Done** — `src/util/retry.h` `retry_io` (exponential backoff 1→100 ms, 5 attempts, EINTR free) wraps the hot syscalls (pipeline open/fstat/pread, serial pread, reader pread); `reader::verify_all()` + `arch verify` report per-entry block/file CRC failures with block index. |
+| Retry + verify (Phase 8) | ✅ **Done** — `src/util/retry.h` `retry_io` (exponential backoff 1→100 ms, 5 attempts, EINTR free) wraps the hot syscalls (pipeline open/fstat/pread, serial pread, reader pread); `reader::verify_all()` + `parch verify` report per-entry block/file CRC failures with block index. |
 | Tests (Catch2) | ✅ **97/97 passing** (default) / **103/103** (`ARCH_WITH_URING=ON`) — includes `test/test_pipeline.cpp` (ordered multi-block delivery, errors, empty files, backpressure bounds, dtor-during-inflight, writer recovery + serial/pipeline byte-identity) and `test/test_reader.cpp` (list roundtrip, extract_all byte-compare + links/xattr/mode/times, data/metadata/footer corruption detection, truncation-point drop, `writer::append` two-section/empty/sticky-DEDUP, dedup + pipelined roundtrips, zip-slip unit tests; `[phase10]`: depth×threads byte-identity matrix, profile report contents + cumulative counters, fd-based xattr/mode restore, parallel-verify error parity; `[profile]`: writer create-profile report contents + counters + on/off byte-identity, serial-fallback profile) and `test/test_cli.cpp` (6 subprocess cases: roundtrip, append-wins, store mode + knobs, error codes/exit statuses, options anywhere, tar-style top dir + `-C` + contents-only + multi-root) `test/test_xattr.cpp` `[acl]` cases (trivial-skip, util blob roundtrip, archive→extract ACL equality incl. default ACLs), and `test/test_sparse.cpp` (14 cases: hole roundtrips pipeline+serial, trailing-hole ftruncate restore, partial-hole guard, v0.2/v0.3 footer flip + `options.sparse=false`, hole↔zero dedup under store mode, append v0.3 stickiness, sparse helper equivalence, `retry_io` backoff/EINTR/cap semantics, `verify_all` by-name reporting + hardlink dup). |
 | CLI (`src/main.cpp`) | ✅ **Done (Phase 5)** — `create`/`append`/`list`/`extract`/`verify` with codec/level/threads/depth/dedup/durability/sparse flags; stderr diagnostics, stdout listings, exit codes 0/1/2; links the static lib with `--whole-archive` (compressor registration); `test/test_cli.cpp` covers roundtrips + error codes end-to-end |
 | Test plan (`docs/testing.md`) | ✅ Complete — 50+ planned future tests with priorities |
@@ -158,12 +158,12 @@ docs/
 > bench; and the **Phase 4 reader** parses + validates archives end-to-end,
 > extracts in a parallel wave pipeline, tolerates truncated tails, and is
 > paired with a working `writer::append()` static factory; and the **Phase 5
-> CLI** (`arch create/append/list/extract`) drives it all end-to-end; and
+> CLI** (`parch create/append/list/extract`) drives it all end-to-end; and
 > **Phase 7** made POSIX ACLs (access + default) first-class on libacl,
 > archive→extract roundtrip-tested; and **Phase 8** made sparse files native
 > (v0.3 `COMPRESSOR_SPARSE` blocks — holes never read or written), added
 > transient-error retry with backoff on the hot syscalls, and a full data
-> `verify` pass (`reader::verify_all()` / `arch verify`); and **Phase 9**
+> `verify` pass (`reader::verify_all()` / `parch verify`); and **Phase 9**
 > benchmarked the result against GNU tar (28× create win on many small
 > files under simulated netfs latency; extract faster than tar on every
 > workload) and documented the memory profile (`docs/benchmarks.md`).
@@ -257,7 +257,7 @@ question in the spec **before** serialization code exists:
    offsets and the absolute-16 write in `finalize()` go away in Phase 2.
 8. **TOC CRC covers metadata only** — `toc_header.crc32c` and
    `toc_section_ref.crc32c` cover header + entries + string table, NOT data
-   blocks, so `arch list` never reads data (data integrity is already covered
+   blocks, so `parch list` never reads data (data integrity is already covered
    per-block). Today's "CRC32C of entire TOC section" would force reading the
    whole archive just to validate metadata.
 9. **XXH3-128 `content_id`** — `block_entry.content_id` grows to 16 bytes
@@ -367,9 +367,9 @@ block CRCs + decompress roundtrip, dedup single-store, tree relative paths).
     ASan/UBSan-clean, TSan-clean (0 warnings × 3 runs).
 
 ### Phase 5: CLI ✅ (2026-11)
-25. ✅ **`src/main.cpp`** — `arch create [opts] <archive> <tree|file...>`,
-    `arch append [opts] <archive> <tree|file...>`, `arch list <archive>`,
-    `arch extract [opts] <archive> [dest]` (dest default `.`). Options map
+25. ✅ **`src/main.cpp`** — `parch create [opts] <archive> <tree|file...>`,
+    `parch append [opts] <archive> <tree|file...>`, `parch list <archive>`,
+    `parch extract [opts] <archive> [dest]` (dest default `.`). Options map
     1:1 to `writer::options`/`reader::options`: `-c/--compressor`
     (`zstd`|`none`), `-l/--level`, `-j/--threads`, `--depth`, `--dedup`,
     `--no-sync`, plus `-v/-q` log levels and `-h`. Diagnostics/progress go to
@@ -377,7 +377,7 @@ block CRCs + decompress roundtrip, dedup single-store, tree relative paths).
     Options accepted before or after the command. Directory args →
     `add_tree`; plain file args → `add_file` (stored by basename). *(The
     directory naming became tar-style in a later follow-up — see item 37.)*
-    Exit codes: 0 ok, 1 runtime/I/O error, 2 usage error. `arch` links
+    Exit codes: 0 ok, 1 runtime/I/O error, 2 usage error. `parch` links
     `archiver_lib` inside an explicit `-Wl,--whole-archive` pair so
     `REGISTER_COMPRESSOR` static init survives (AGENTS.md linking note
     resolved; `-c none` store mode also fixed on the serial writer paths,
@@ -423,7 +423,7 @@ block CRCs + decompress roundtrip, dedup single-store, tree relative paths).
     parse; errors name the file **and the block index** (`"x.bin: block CRC
     mismatch in x.bin (block 3)"`). New `reader::verify_all()` runs the whole
     data pass without writing output (`/dev/null` sink, hardlink dups
-    verified through the owner); `arch verify` exposes it (one failing entry
+    verified through the owner); `parch verify` exposes it (one failing entry
     per line on stdout, exit 1 on any failure).
 30. ✅ **Sparse file support** — `src/io/sparse.h` + `writer::options.sparse`
     (default on, CLI `--no-sparse` to opt out): whole-hole blocks (checked via
@@ -455,7 +455,7 @@ block CRCs + decompress roundtrip, dedup single-store, tree relative paths).
     vs GNU tar 1.35 `--zstd -3` (bsdtar absent on this machine).
     Headline (`docs/benchmarks.md`): on the simulated netfs, pipeline
     create is **28× faster** than tar *and* than the serial path
-    (97.7 vs 3.5 MiB/s); locally arch create is 0.6–0.7× of tar but
+    (97.7 vs 3.5 MiB/s); locally parch create is 0.6–0.7× of tar but
     **extract beats tar on every workload** (1.3–2.4×, block-parallel
     decompression); depth is a latency knob (local peak at 4).
 33. ✅ **Memory profiling** — documented in `docs/benchmarks.md` §4:
@@ -503,7 +503,7 @@ block CRCs + decompress roundtrip, dedup single-store, tree relative paths).
     pooling): `reader::options{threads, depth, profile}`, single-fd
     `extract_one` (data + `fchmod`/`fchown`/`futimens` + `fsetxattr`/
     `acl_set_fd` on one descriptor), pooled waves 1/3/4 + parallel
-    `verify_all` with job-order error parity, `arch extract/verify
+    `verify_all` with job-order error parity, `parch extract/verify
     --depth/--profile` CLI flags, bench depth sweep. Acceptance exceeded:
     210 MiB/s at depth 32 under the 500 µs shim (target ~70–85; Phase 9
     baseline 13.9). Profiler reports per-stage ns + ops with tuning hints
@@ -525,7 +525,7 @@ block CRCs + decompress roundtrip, dedup single-store, tree relative paths).
     bench create path. 2 new `[profile]` tests incl. on/off byte-identity
     (95/95 default, 101/101 uring; ASan/UBSan/TSan clean).
 37. ✅ **CLI tar-style directory naming + `-C`** (2026-11 follow-up) —
-    `arch create/append a.arc dir` now stores the top level like tar
+    `parch create/append a.arc dir` now stores the top level like tar
     (`dir`, `dir/...`; trailing slash irrelevant), fixing both the
     create→extract asymmetry and the multi-directory root-collision footgun
     (`dir1/conf` vs `dir2/conf`). Library change is format-compatible and

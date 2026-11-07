@@ -6,7 +6,7 @@ expected ~5×; full data + local trade-off in `docs/benchmarks.md` §3.1).
 Option B (§4) remains gated on a real-NFS bandwidth measurement. Original
 motivation below: Phase 9
 benchmark (`docs/benchmarks.md` §3, conclusion 6): under 500 µs simulated
-netfs latency, `arch create` reaches 97.7 MiB/s (pipeline) but
+netfs latency, `parch create` reaches 97.7 MiB/s (pipeline) but
 `extract_all` only 13.9 MiB/s — extraction parallelizes *decompression*
 but not the per-file *round-trip storm*, so it stays latency-bound.
 
@@ -91,7 +91,7 @@ struct reader::options {
 ```
 
 - Mirrors `writer::options{threads, pipeline_depth}`; CLI gains
-  `arch extract --depth N` (same word, same meaning as `create`).
+  `parch extract --depth N` (same word, same meaning as `create`).
 - Memory model: each file-pool worker holds at most one live block pair
   (compressed + decompressed, ≤ 8 MiB); the **decode semaphore** (size
   `threads`) bounds how many workers may be in the read+decompress
@@ -193,7 +193,7 @@ hints**:
 | utilization < 25 % with no dominant stage | stalls *between* spans → raise `--depth` |
 
 The report is emitted to stderr at the end of `extract_all`/`verify_all`
-when the flag is on (`arch extract/verify --profile`;
+when the flag is on (`parch extract/verify --profile`;
 `ARCH_BENCH_PROFILE=1` for the bench). Counters are cumulative across
 both ops on one reader. Measured payoff (§3.1 addendum): under the shim
 the report shows 97.9 % of busy in `create+open` at 98.5 % utilization —
@@ -219,7 +219,7 @@ thread (`writer wait`, judged against wall — its hint distinguishes
 pipeline is the fix", §4), archive pwrite, dedup lookup and toc+fsync.
 The serial fallback reports into the same slots, and on/off runs are
 byte-identical. So the §4 Option-B gate can now be decided from data:
-run `arch create --profile` on the real workload and read which hint
+run `parch create --profile` on the real workload and read which hint
 fires.
 
 ## 4. Option B — staged `arch::io::extract_pipeline` (only if B is needed)

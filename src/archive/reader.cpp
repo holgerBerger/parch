@@ -669,7 +669,7 @@ std::string reader::impl::profile_report() const
               (static_cast<double>(wall_ns.load()) * std::max(1, opts.depth))
         : 0.0;
     std::snprintf(line, sizeof line,
-                  "arch profile: %llu files, %.1f MiB written, %.3f s wall, "
+                  "parch profile: %llu files, %.1f MiB written, %.3f s wall, "
                   "workers=%d permits=%d, busy=%.2f s (%.1f%% worker utilization)\n",
                   (unsigned long long)files_done.load(), bytes / (1 << 20), wall,
                   std::max(1, opts.depth), gate->permits(), busy / 1e9,
@@ -692,7 +692,7 @@ std::string reader::impl::profile_report() const
     if (busy == 0 || wall == 0) return out;
     if (rt > 0.30) {
         std::snprintf(line, sizeof line,
-                      "arch profile hint: output-side RTs (create+open+metadata) are %.0f%% "
+                      "parch profile hint: output-side RTs (create+open+metadata) are %.0f%% "
                       "of worker time — latency-bound: raise --depth (currently %d)%s\n",
                       rt * 100.0, std::max(1, opts.depth),
                       opts.depth >= 128 ? " (already deep: the target FS's metadata "
@@ -702,7 +702,7 @@ std::string reader::impl::profile_report() const
     }
     if (frac(STG_PERMIT_WAIT) > 0.15) {
         std::snprintf(line, sizeof line,
-                      "arch profile hint: workers wait %.0f%% of busy time on decode permits "
+                      "parch profile hint: workers wait %.0f%% of busy time on decode permits "
                       "— -j %d is the bottleneck: raise -j, or lower the compression level "
                       "to cut per-block CPU\n",
                       frac(STG_PERMIT_WAIT) * 100.0, gate->permits());
@@ -710,14 +710,14 @@ std::string reader::impl::profile_report() const
     }
     if (cpu > 0.50) {
         std::snprintf(line, sizeof line,
-                      "arch profile hint: CRC+decompress is %.0f%% of busy time — CPU-bound: "
+                      "parch profile hint: CRC+decompress is %.0f%% of busy time — CPU-bound: "
                       "more -j (up to core count), or trade ratio for speed with a lower -l\n",
                       cpu * 100.0);
         out += line; ++hints;
     }
     if (frac(STG_PREAD) > 0.50) {
         std::snprintf(line, sizeof line,
-                      "arch profile hint: archive reads are %.0f%% of busy time — source "
+                      "parch profile hint: archive reads are %.0f%% of busy time — source "
                       "bandwidth/latency-bound; one huge file = one cursor (block fan-out "
                       "needs the staged pipeline, docs/extract-pipeline.md §4)\n",
                       frac(STG_PREAD) * 100.0);
@@ -725,7 +725,7 @@ std::string reader::impl::profile_report() const
     }
     if (frac(STG_PWRITE) > 0.40) {
         std::snprintf(line, sizeof line,
-                      "arch profile hint: destination writes are %.0f%% of busy time — "
+                      "parch profile hint: destination writes are %.0f%% of busy time — "
                       "target bandwidth-bound; page-cache hygiene (fadvise/DIRECT) is the "
                       "lever, not threads (docs/extract-pipeline.md §7.2)\n",
                       frac(STG_PWRITE) * 100.0);
@@ -733,13 +733,13 @@ std::string reader::impl::profile_report() const
     }
     if (util < 0.25 && rt <= 0.30 && frac(STG_PERMIT_WAIT) <= 0.15) {
         std::snprintf(line, sizeof line,
-                      "arch profile hint: workers are only %.0f%% busy and no stage dominates "
+                      "parch profile hint: workers are only %.0f%% busy and no stage dominates "
                       "— stalls sit between spans (kernel I/O waits): raise --depth (now %d)\n",
                       util * 100.0, std::max(1, opts.depth));
         out += line; ++hints;
     }
     if (hints == 0)
-        out += "arch profile hint: no single dominant bottleneck\n";
+        out += "parch profile hint: no single dominant bottleneck\n";
     return out;
 }
 

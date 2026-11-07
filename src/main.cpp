@@ -1,10 +1,10 @@
 /*
  * archiver – CLI (PLAN.md Phase 5, item 25).
  *
- *   arch create  [opts] <archive> <tree|file...>   build a new archive
- *   arch append  [opts] <archive> <tree|file...>   add a section to one
- *   arch list    [opts] <archive>                  show entries
- *   arch extract [opts] <archive> [dest]           unpack (dest = ".")
+ *   parch create  [opts] <archive> <tree|file...>   build a new archive
+ *   parch append  [opts] <archive> <tree|file...>   add a section to one
+ *   parch list    [opts] <archive>                  show entries
+ *   parch extract [opts] <archive> [dest]           unpack (dest = ".")
  *
  * Writer/reader options map 1:1 to arch::writer::options /
  * arch::reader::options (docs/api.md). Paths that are directories go through
@@ -58,11 +58,11 @@ struct cli_opts {
     if (!msg.empty()) spdlog::error("{}", msg);
     std::FILE* sink = code == 0 ? stdout : stderr;
     std::fprintf(sink,
-        "usage: arch create  [opts] <archive> <tree|file...>\n"
-        "       arch append  [opts] <archive> <tree|file...>\n"
-        "       arch list    [opts] <archive>\n"
-        "       arch extract [opts] <archive> [dest]      (dest default: .)\n"
-        "       arch verify  [opts] <archive>             (check all block + file CRCs)\n"
+        "usage: parch create  [opts] <archive> <tree|file...>\n"
+        "       parch append  [opts] <archive> <tree|file...>\n"
+        "       parch list    [opts] <archive>\n"
+        "       parch extract [opts] <archive> [dest]      (dest default: .)\n"
+        "       parch verify  [opts] <archive>             (check all block + file CRCs)\n"
         "\nopts:\n"
         "  -c, --compressor NAME   zstd (default) or none (store)\n"
         "  -l, --level N           compression level (default 3)\n"
@@ -121,7 +121,7 @@ std::vector<std::string> parse_args(int argc, char** argv, cli_opts& o) {
         else if (a == "-q" || a == "--quiet") o.log_level = spdlog::level::err;
         else if (a == "-h" || a == "--help") { usage_error("", 0); }
         else if (a == "--version") {
-            std::printf("arch %s (format v0.2)\n",
+            std::printf("parch %s (format v0.2)\n",
 #ifdef ARCH_CLI_VERSION
                         ARCH_CLI_VERSION
 #else
@@ -213,7 +213,7 @@ std::string human(std::uint64_t bytes) {
 // path component ("dir", "some/dir", "/abs/dir", "dir/" all → "dir"; ".." →
 // the resolved parent's name). A final "." component ("." or "dir/.") opts
 // out — contents-only storage, the add_tree default — which is how
-// `arch create a.arc -C DIR .`-style workflows name DIR's contents directly.
+// `parch create a.arc -C DIR .`-style workflows name DIR's contents directly.
 std::string tree_prefix(const std::string& a) {
     namespace fs = std::filesystem;
     std::string s = a;
@@ -238,7 +238,7 @@ int cmd_write(bool append_mode, std::vector<std::string> args, const cli_opts& o
             throw std::system_error(ENOENT, std::generic_category(), a);
 
     const auto src = stat_sources(args);
-    spdlog::info("arch{} {}: {} file(s), {} dir(s), {} other entr(ies), {} input",
+    spdlog::info("parch{} {}: {} file(s), {} dir(s), {} other entr(ies), {} input",
                  append_mode ? "ive append" : " creating", arc.string(),
                  src.files, src.dirs, src.others, human(src.bytes));
 
@@ -296,7 +296,7 @@ std::string id_name(std::uint32_t id, bool is_user) {
 }
 
 int cmd_list(std::vector<std::string> args, const cli_opts& o) {
-    if (args.size() != 1) usage_error("usage: arch list <archive>");
+    if (args.size() != 1) usage_error("usage: parch list <archive>");
     arch::reader r(args.front(), arch::reader::options{});
     const auto entries = r.list();
 
@@ -340,7 +340,7 @@ int cmd_list(std::vector<std::string> args, const cli_opts& o) {
 }
 
 int cmd_extract(std::vector<std::string> args, const cli_opts& o) {
-    if (args.empty() || args.size() > 2) usage_error("usage: arch extract <archive> [dest]");
+    if (args.empty() || args.size() > 2) usage_error("usage: parch extract <archive> [dest]");
     const std::filesystem::path arc = args.front();
     const std::filesystem::path dest = args.size() > 1 ? args[1] : ".";
 
@@ -359,7 +359,7 @@ int cmd_extract(std::vector<std::string> args, const cli_opts& o) {
 }
 
 int cmd_verify(std::vector<std::string> args, const cli_opts& o) {
-    if (args.size() != 1) usage_error("usage: arch verify <archive>");
+    if (args.size() != 1) usage_error("usage: parch verify <archive>");
     arch::reader::options ro;
     if (o.threads_given) ro.threads = o.threads;
     ro.depth = static_cast<int>(o.depth);
@@ -381,9 +381,9 @@ int cmd_verify(std::vector<std::string> args, const cli_opts& o) {
 
 int main(int argc, char** argv) {
     // Diagnostics/progress on stderr; `list` output on stdout (scriptable).
-    spdlog::set_default_logger(spdlog::stderr_color_st("arch"));
-    // Command-first or options-first both work: `arch create a.arc src` and
-    // `arch -q create a.arc src` parse identically (first positional = cmd).
+    spdlog::set_default_logger(spdlog::stderr_color_st("parch"));
+    // Command-first or options-first both work: `parch create a.arc src` and
+    // `parch -q create a.arc src` parse identically (first positional = cmd).
     cli_opts o;
     auto pos = parse_args(argc - 1, argv + 1, o);
     spdlog::set_level(o.log_level);

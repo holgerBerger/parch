@@ -1,4 +1,4 @@
-// Phase 5: CLI end-to-end tests — run the `arch` binary as a subprocess and
+// Phase 5: CLI end-to-end tests — run the `parch` binary as a subprocess and
 // verify exit codes, stdout shape, and full create/list/extract/append
 // round-trips (the binary itself is the unit under test, not the library).
 #include <catch2/catch_test_macros.hpp>
@@ -13,7 +13,7 @@
 #include <pwd.h>
 
 #ifndef ARCH_CLI_BINARY
-#define ARCH_CLI_BINARY "build/arch"   // override via compile definition
+#define ARCH_CLI_BINARY "build/parch"   // override via compile definition
 #endif
 
 using namespace std::string_literals;
@@ -261,7 +261,7 @@ TEST_CASE("cli: error codes and messages", "[cli]") {
     // --help exits 0 and prints usage
     r = run(cli("-h"));
     CHECK(r.code == 0);
-    CHECK(contains(r.out, "usage: arch"));
+    CHECK(contains(r.out, "usage: parch"));
 
     // --version exits 0 and prints the format version
     r = run(cli("--version"));

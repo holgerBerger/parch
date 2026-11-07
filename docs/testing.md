@@ -23,7 +23,7 @@ drive individual CTest entries.
 | `test_pipeline.cpp` | `io::pipeline` consumption contract: multi-file submit/next_block/release ordering, bounded permits, error propagation, serial fallback equivalence. |
 | `test_reader.cpp` | reader validation chain (footer/TOC/section CRCs, truncation tolerance), `list()`, `extract_all` wave order, symlink/hardlink/FIFO/device restore, zip-slip guard, corruption detection. |
 | `test_sparse.cpp` | Phase 8: sparse hole roundtrips (pipeline + serial), v0.3 footer flip + `--no-sparse`, trailing-hole `ftruncate`, hole↔zero-block dedup, append v0.3 stickiness, `block_is_hole`/`zero_digest`/`crc_extend_zeros`, `retry_io` backoff semantics, `verify_all` error reporting (`[sparse][retry][verify][dedup][append]`). |
-| `test_cli.cpp` | `arch create/append/list/extract/verify` subprocess behaviour: option handling, exit codes, tar-style top-dir/`-C`/contents-only naming + multi-root, roundtrips incl. sparse inputs. |
+| `test_cli.cpp` | `parch create/append/list/extract/verify` subprocess behaviour: option handling, exit codes, tar-style top-dir/`-C`/contents-only naming + multi-root, roundtrips incl. sparse inputs. |
 
 ## Future tests (to implement as code is written)
 

@@ -917,7 +917,7 @@ std::string writer::impl::profile_report() const
     const double bin = double(bytes_in.load());
     const double bytes_st = double(bytes_stored.load());
     std::snprintf(line, sizeof line,
-                  "arch create profile: %llu files, %.1f MiB read -> %.1f MiB "
+                  "parch create profile: %llu files, %.1f MiB read -> %.1f MiB "
                   "stored (%.1f%%), dedup %llu hits / %.1f MiB saved, %.3f s "
                   "wall, io=%llu compress=%llu writer=1, busy=%.2f s "
                   "(%.1f%% worker utilization)\n",
@@ -948,12 +948,12 @@ std::string writer::impl::profile_report() const
     const double src_rt = frac(STG_WALK) + frac(STG_OPEN) + frac(STG_META);
     if (src_rt > 0.30) {
         if (frac(STG_WALK) > 0.20)
-            add_hint("arch create hint: the tree walk (readdir+lstat, single "
+            add_hint("parch create hint: the tree walk (readdir+lstat, single "
                      "threaded) is %.0f%% of worker time — depth cannot help "
                      "it; parallelizing the walk is the remaining latency win "
                      "on netfs\n", frac(STG_WALK) * 100.0);
         else
-            add_hint("arch create hint: source-side RTs (walk+open+xattr) are "
+            add_hint("parch create hint: source-side RTs (walk+open+xattr) are "
                      "%.0f%% of worker time — latency-bound: raise --depth "
                      "(currently %zu)%s\n", src_rt * 100.0,
                      opts.pipeline_depth,
@@ -963,18 +963,18 @@ std::string writer::impl::profile_report() const
                          : "");
     }
     if (frac(STG_COMPRESS) > 0.45)
-        add_hint("arch create hint: compression is %.0f%% of worker time — "
+        add_hint("parch create hint: compression is %.0f%% of worker time — "
                  "CPU-bound: raise -j (now %d, up to core count) or trade "
                  "ratio for speed with a lower -l\n",
                  frac(STG_COMPRESS) * 100.0, opts.threads);
     if (frac(STG_HASH) > 0.15)
-        add_hint("arch create hint: XXH3 dedup hashing is %.0f%% of worker "
+        add_hint("parch create hint: XXH3 dedup hashing is %.0f%% of worker "
                  "time and dedup saved %.1f MiB of %.1f stored — if that "
                  "ratio is poor, drop --dedup\n", frac(STG_HASH) * 100.0,
                  double(dedup_bytes_saved.load()) / (1 << 20),
                  bytes_st / (1 << 20));
     if (frac(STG_PERMIT_WAIT) > 0.15)
-        add_hint("arch create hint: I/O workers stall %.0f%% of worker time "
+        add_hint("parch create hint: I/O workers stall %.0f%% of worker time "
                  "on block permits — reads outrun the downstream (compress "
                  "%.0f%%, archive write %.0f%%): raise -j, or the destination "
                  "write path is the wall\n", frac(STG_PERMIT_WAIT) * 100.0,
@@ -982,7 +982,7 @@ std::string writer::impl::profile_report() const
     const double ww = wns > 0
         ? double(stages[STG_WRITER_WAIT].ns.load()) / double(wns) : 0.0;
     if (ww > 0.35)
-        add_hint("arch create hint: the writer thread is %.0f%% idle waiting "
+        add_hint("parch create hint: the writer thread is %.0f%% idle waiting "
                  "for blocks — producers limit the run: many files -> raise "
                  "--depth (now %zu); a few huge files -> one I/O thread per "
                  "file caps lookahead at 2 blocks (staged pipeline, "
@@ -990,16 +990,16 @@ std::string writer::impl::profile_report() const
                  ww * 100.0, opts.pipeline_depth);
     const double dst = frac(STG_PWRITE) + frac(STG_TOC);
     if (dst > 0.30)
-        add_hint("arch create hint: archive writes + TOC/fsync are %.0f%% of "
+        add_hint("parch create hint: archive writes + TOC/fsync are %.0f%% of "
                  "worker time — destination bandwidth/durability wall; "
                  "--no-sync removes the fsync barriers (toc+footer %.0f%% "
                  "includes them)\n", dst * 100.0, frac(STG_TOC) * 100.0);
     if (util < 0.25 && src_rt <= 0.30 && frac(STG_PERMIT_WAIT) <= 0.15 && ww <= 0.35)
-        add_hint("arch create hint: workers are only %.0f%% busy and no stage "
+        add_hint("parch create hint: workers are only %.0f%% busy and no stage "
                  "dominates — stalls sit between spans (kernel waits): raise "
                  "--depth (now %zu)\n", util * 100.0, opts.pipeline_depth);
     if (hints == 0)
-        out += "arch create hint: no single dominant bottleneck\n";
+        out += "parch create hint: no single dominant bottleneck\n";
     return out;
 }
 
