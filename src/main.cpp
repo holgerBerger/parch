@@ -156,43 +156,6 @@ arch::writer::options writer_opts(const cli_opts& o) {
     return w;
 }
 
-struct source_stats {
-    std::uint64_t bytes = 0;
-    std::uint64_t files = 0;
-    std::uint64_t dirs = 0;
-    std::uint64_t others = 0; // symlinks/devices/fifos
-};
-
-source_stats stat_sources(const std::vector<std::string>& args) {
-    namespace fs = std::filesystem;
-    source_stats s;
-    for (const auto& a : args) {
-        std::error_code ec;
-        if (fs::is_directory(a, ec)) {
-            for (fs::recursive_directory_iterator it(a, fs::directory_options::skip_permission_denied, ec), end;
-                 it != end; it.increment(ec)) {
-                if (ec) continue;
-                std::error_code sec;
-                const auto type = it->symlink_status(sec).type();
-                if (sec) continue;
-                if (type == fs::file_type::directory) ++s.dirs;
-                else if (type == fs::file_type::regular) {
-                    s.bytes += static_cast<std::uint64_t>(fs::file_size(*it, ec));
-                    if (!ec) ++s.files;
-                } else ++s.others;
-            }
-        } else if (fs::is_regular_file(a, ec)) {
-            s.bytes += static_cast<std::uint64_t>(fs::file_size(a, ec));
-            if (!ec) ++s.files;
-        } else if (fs::exists(a, ec)) {
-            ++s.others; // add_file on a symlink/device stores the target's data
-        } else {
-            throw std::system_error(ENOENT, std::generic_category(), a);
-        }
-    }
-    return s;
-}
-
 std::uint64_t file_size_of(const std::filesystem::path& p) {
     std::error_code ec;
     const auto n = std::filesystem::file_size(p, ec);
@@ -245,35 +208,45 @@ int cmd_write(bool append_mode, std::vector<std::string> args, const cli_opts& o
         if (!std::filesystem::exists(a))
             throw std::system_error(ENOENT, std::generic_category(), a);
 
-    const auto src = stat_sources(args);
-    spdlog::info("parch{} {}: {} file(s), {} dir(s), {} other entr(ies), {} input",
-                 append_mode ? "ive append" : " creating", arc.string(),
-                 src.files, src.dirs, src.others, human(src.bytes));
+    // No proactive stat pass: on a metadata-rate-bound network FS a full
+    // tree walk just to print counts costs tens of thousands of server
+    // round-trips. The line is emitted up front without them, and the
+    // totals come after the fact from the writer's buffered TOC entries.
+    spdlog::info("parch{} {}", append_mode ? "ive appending to" : " creating",
+                 arc.string());
 
     const auto t0 = clock_t_::now();
+    arch::writer::summary sum; // counts by entry kind + input bytes
     if (append_mode) {
         auto w = arch::writer::append(arc, writer_opts(o));
         for (const auto& a : args)
             std::filesystem::is_directory(a) ? w.add_tree(a, tree_prefix(a))
                                              : w.add_file(a);
+        sum = w.contents();
         w.finalize();
     } else {
         arch::writer w(arc, writer_opts(o));
         for (const auto& a : args)
             std::filesystem::is_directory(a) ? w.add_tree(a, tree_prefix(a))
                                              : w.add_file(a);
+        sum = w.contents();
         w.finalize();
     }
     const double secs = elapsed_s(t0);
 
     const std::uint64_t out = file_size_of(arc);
     if (append_mode)
-        spdlog::info("done in {:.2f}s — archive now {}", secs, human(out));
+        spdlog::info("done in {:.2f}s — added {} file(s), {} dir(s), {} other "
+                     "entr(ies), {} input — archive now {}",
+                     secs, sum.files, sum.dirs, sum.others, human(sum.bytes),
+                     human(out));
     else
-        spdlog::info("done in {:.2f}s — archive {} ({:.1f}% of input)", secs,
+        spdlog::info("done in {:.2f}s — {} file(s), {} dir(s), {} other "
+                     "entr(ies), {} input — archive {} ({:.1f}% of input)",
+                     secs, sum.files, sum.dirs, sum.others, human(sum.bytes),
                      human(out),
-                     src.bytes ? 100.0 * static_cast<double>(out) /
-                                     static_cast<double>(src.bytes) : 0.0);
+                     sum.bytes ? 100.0 * static_cast<double>(out) /
+                                     static_cast<double>(sum.bytes) : 0.0);
     return 0;
 }
 

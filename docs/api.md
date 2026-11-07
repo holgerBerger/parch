@@ -127,10 +127,13 @@ Recursively archives the directory tree at `root`:
 - Entry names are stored **relative to `root`** (no leading `/`, no `..`).
 - Directories become metadata entries; devices/fifos/sockets as in `add_file`.
 - Hardlink duplicates share one data set via `link_target_id` (inode→path map).
-- The walk feeds the I/O pipeline: `pipeline_depth` files are stat/ed/opened/
-  read concurrently — this is why recursion is a first-class operation rather
-  than a caller-side loop (a serial loop re-creates the per-file network
-  round-trip cost the archiver exists to hide).
+- The walk STREAMS into the I/O pipeline: each file is submitted the moment
+  discovery reaches it (up to `pipeline_depth` files stat/ed/opened/read
+  concurrently), so archive bytes are written while the tree is still being
+  walked and discovery round-trips overlap with data flow — this is why
+  recursion is a first-class operation rather than a caller-side loop (a
+  serial loop re-creates the per-file network round-trip cost the archiver
+  exists to hide).
 - With a non-empty `store_prefix` (tar-style storage of the top level): the
   root itself becomes a directory entry named `store_prefix` (stored first,
   like tar lists `dir/`) and every descendant is stored under
@@ -163,18 +166,31 @@ everything added so far plus tuning hints — the writer-side counterpart of
 `xattr+read` (metadata reads), `source read` (block preads + `SEEK_DATA`
 hole scans), `crc32c`, `xxh3 dedup` (hashing), `compress`, `permit wait`
 (I/O workers blocked on in-RAM block permits — reads outrunning the
-downstream), `tree walk` (the serial readdir/lstat pass), `writer wait`
+downstream), `tree walk` (streaming discovery round-trips:
+readdir/lstat/readlink, counted per item), `writer wait`
 (the single consumer thread blocked on producers), `archive write`,
 `dedup lookup`, and `toc+footer` (serialization + fsync barriers). The
 header line reports file/byte counters, dedup hits + bytes saved, wall
 time and worker utilization. Hints map dominant stages to knobs:
-walk/open/metadata share → `--depth` (or note that only a parallel walk
-helps), compress share → `-j` / lower `-l`, hashing share vs. saved bytes
+walk/open/metadata share → `--depth` (or note that the FS's metadata rate
+is the floor), compress share → `-j` / lower `-l`, hashing share vs. saved bytes
 → drop `--dedup`, permit wait → `-j` or destination write wall, writer
 wait → `--depth` (many files) or the staged pipeline for a few huge files
 (`docs/extract-pipeline.md` §4), write+TOC share → `--no-sync`. Cumulative
 across `add_file`/`add_tree`/`finalize`; empty string when profiling is
 off; never affects the archive bytes.
+
+### `summary contents() const`
+
+Content added to this writer so far — `{files, dirs, others, bytes}` —
+derived from the buffered TOC entries with **zero filesystem
+round-trips** (`bytes` sums uncompressed sizes of regular-file entries;
+hardlink duplicates count as files, symlinks/devices/FIFOs as `others`).
+Call **before** `finalize()` (the entry buffer is released with the
+section). The CLI uses this to report totals *after* creation instead of
+walking the tree up front for the counts — on a metadata-rate-bound
+network FS that proactive pass costs tens of thousands of MDS RPCs for a
+log line.
 
 ### `static writer append(path, opts = {})`
 

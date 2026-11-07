@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <filesystem>
+#include <fstream>
 #include <thread>
 
 TEST_CASE("writer creates archive with header", "[writer]") {
@@ -195,4 +196,32 @@ TEST_CASE("writer profile: serial fallback reports into the same stages", "[writ
     CHECK(rep.find("dedup 2 hits") != std::string::npos);
 
     fs::remove_all(root); fs::remove(arc);
+}
+
+TEST_CASE("writer::contents(): entry counts + bytes from the buffered TOC", "[writer]") {
+    namespace fs = std::filesystem;
+    const auto rp = fs::temp_directory_path() / "arch_contents_tree";
+    fs::remove_all(rp);
+    const fs::path src = rp / "src", arc = rp / "t.arc";
+    fs::create_directories(src / "sub");
+    { std::ofstream(src / "a.txt") << "aaaa"; }     // 4 B
+    { std::ofstream(src / "sub/b.txt") << "bb"; }   // 2 B
+    fs::create_symlink("a.txt", src / "link");
+    fs::create_hard_link(src / "a.txt", src / "sub/a2.txt"); // dup: own size counts
+
+    // Pipelined and serial paths buffer the same entries: identical counts.
+    for (int threads : {4, 0}) {
+        fs::remove(arc);
+        arch::writer::options o;
+        o.threads = threads;
+        arch::writer w(arc, o);
+        w.add_tree(src, "src"); // tar-style prefix: "src" itself is a dir entry
+        const auto s = w.contents();
+        CHECK(s.files  == 3); // a.txt, sub/b.txt, sub/a2.txt (hardlink dup)
+        CHECK(s.dirs   == 2); // src, src/sub
+        CHECK(s.others == 1); // symlink
+        CHECK(s.bytes  == 4 + 2 + 4);
+        w.finalize();
+    }
+    fs::remove_all(rp);
 }

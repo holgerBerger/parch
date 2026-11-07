@@ -76,6 +76,20 @@ public:
     /// finalize; covers both the pipelined and the serial fallback paths.
     std::string profile_report() const;
 
+    /// Content added to this writer so far, derived from the buffered TOC
+    /// entries — zero filesystem round-trips (a proactive stat pass is
+    /// expensive on network filesystems). Counts are by stored entry kind
+    /// (symlinks/devices/FIFOs land in `others`), `bytes` sums the
+    /// uncompressed sizes of regular-file entries. Call before finalize():
+    /// the entry buffer is released with the section.
+    struct summary {
+        std::uint64_t files = 0;
+        std::uint64_t dirs = 0;
+        std::uint64_t others = 0;
+        std::uint64_t bytes = 0;
+    };
+    summary contents() const;
+
     /// Open an existing finalized archive for appending: validates the
     /// footer + TOC table, keeps the existing sections, and truncates the
     /// old TOC table + footer so the next added section (or `finalize()`'s

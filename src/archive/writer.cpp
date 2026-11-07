@@ -954,10 +954,12 @@ std::string writer::impl::profile_report() const
     const double src_rt = frac(STG_WALK) + frac(STG_OPEN) + frac(STG_META);
     if (src_rt > 0.30) {
         if (frac(STG_WALK) > 0.20)
-            add_hint("parch create hint: the tree walk (readdir+lstat, single "
-                     "threaded) is %.0f%% of worker time — depth cannot help "
-                     "it; parallelizing the walk is the remaining latency win "
-                     "on netfs\n", frac(STG_WALK) * 100.0);
+            add_hint("parch create hint: tree-walk discovery (readdir+lstat) is "
+                     "%.0f%% of worker time — the walk is streamed (creation "
+                     "already starts during traversal), so this is MDS RPC "
+                     "contention, not a barrier: fewer walk round-trips (d_type "
+                     "classification / cached statx) or a faster/spread MDS is "
+                     "the win\n", frac(STG_WALK) * 100.0);
         else
             add_hint("parch create hint: source-side RTs (walk+open+xattr) are "
                      "%.0f%% of worker time — latency-bound: raise --depth "
@@ -1164,9 +1166,10 @@ void writer::add_tree(const std::filesystem::path& root, std::string store_prefi
     // Deterministic depth-first walk (names sorted per directory). Archive
     // paths are relative to `root` (frozen decision) unless `store_prefix` is
     // given, in which case every name is prefixed and the root itself becomes
-    // a directory entry (tar-style). The walk only collects jobs; consumption
-    // happens in the exact same order afterwards, so output is
-    // scheduling-independent.
+    // a directory entry (tar-style). The walk STREAMS: entries are consumed
+    // (and files submitted to the pipeline) in discovery order, so discovery
+    // round-trips overlap with data flow; `items` only queues the not-yet-
+    // consumed prefix while the in-flight window is saturated.
     struct tree_item {
         fs::path abs;
         std::string rel;
@@ -1209,16 +1212,20 @@ void writer::add_tree(const std::filesystem::path& root, std::string store_prefi
         items.push_back(std::move(rit));
     }
 
-    {
-        // readdir + lstat + readlink per entry: on a network FS this is a full
-        // metadata pass over the tree (walked serially today — see the walk
-        // stage hint). Scoped so the timer stops before consumption.
+    // Streaming walk: next_item() discovers one entry per call (readdir when
+    // descending + lstat + readlink) in walk order. Feeding the pipeline as
+    // files are discovered — instead of a full collect pass first — keeps
+    // discovery round-trips off the critical path (they overlap block
+    // streaming) and lands the first archive bytes while the tree is still
+    // being walked. The STG_WALK timer accumulates discovery time only, so
+    // the profile stays meaningful even while interleaved with consumption.
+    auto next_item = [&](tree_item& it) -> bool {
+        if (stack.empty()) return false;
         util::profile::span walk(d->T(impl::STG_WALK));
-    while (!stack.empty()) {
         auto [abs, rel] = stack.back();
         stack.pop_back();
 
-        tree_item it;
+        it = tree_item{};
         it.abs = std::move(abs);
         it.rel = std::move(rel);
         if (::lstat(it.abs.c_str(), &it.st)) {
@@ -1235,7 +1242,9 @@ void writer::add_tree(const std::filesystem::path& root, std::string store_prefi
             it.text = fs::read_symlink(it.abs).string();
         } else if (S_ISREG(it.st.st_mode) && it.st.st_nlink > 1) {
             // Hardlink: first path storing data owns the inode; duplicates
-            // reference it via link_target_id (spec §File Entry).
+            // reference it via link_target_id (spec §File Entry). Ownership
+            // is decided by the walking thread in walk order (alphabetical
+            // first path wins) — deterministic regardless of consumption.
             auto key = std::make_pair(static_cast<std::uint64_t>(it.st.st_dev),
                                       static_cast<std::uint64_t>(it.st.st_ino));
             if (auto found = d->inode_paths.find(key); found != d->inode_paths.end()) {
@@ -1250,9 +1259,8 @@ void writer::add_tree(const std::filesystem::path& root, std::string store_prefi
         } else {
             it.kind = tree_item::kMeta; // blk/chr/fifo/sock: metadata-only
         }
-        items.push_back(std::move(it));
-    }
-    }
+        return true;
+    };
 
     // ---- consumption, strictly in walk order ----
     auto consume_meta = [&](tree_item& it) {
@@ -1274,38 +1282,17 @@ void writer::add_tree(const std::filesystem::path& root, std::string store_prefi
         }
     };
 
-    if (d->opts.threads <= 0) {
-        // Serial fallback (also the reference for determinism tests).
-        for (auto& it : items) {
-            if (it.kind != tree_item::kFile) { consume_meta(it); continue; }
-            int fd = ::open(it.abs.c_str(), O_RDONLY | O_NOFOLLOW);
-            if (fd < 0) {
-                int e2 = errno;
-                throw std::system_error(e2, std::generic_category(), "open failed: " + it.abs.string());
-            }
-            d->add_file_impl(it.rel, it.abs,
-                             static_cast<std::uint64_t>(it.st.st_size), fd);
-        }
-        return;
-    }
-
-    // Phase 3 pipeline: keep up to `depth` files in flight. Files are
-    // submitted in walk order and consumed in walk order; the window keeps
-    // I/O workers busy (network-FS latency hidden across files) while the
-    // writer streams blocks to disk in the exact serial-path order.
-    auto* pipe = d->get_pipeline();
-    const std::size_t depth = std::max<std::size_t>(d->opts.pipeline_depth, 1);
-    std::size_t next_consume = 0;
-
     auto consume_one = [&](tree_item& it) {
         if (it.kind == tree_item::kFile) d->consume_pipelined_file(it.rel, it.seq);
         else consume_meta(it);
         it.done = true;
     };
-
+    auto* pipe = d->opts.threads > 0 ? d->get_pipeline() : nullptr;
     auto reap_rest = [&] {
         // Error path: retire every submitted-but-undrained file so the
-        // writer stays usable (in-flight slots and permits freed).
+        // writer stays usable (in-flight slots and permits freed). Items
+        // discovered-but-not-yet-submitted carry seq ~0 — a safe no-op.
+        if (!pipe) return;
         for (auto& it : items)
             if (it.kind == tree_item::kFile && !it.done) {
                 try { pipe->wait_file_done(it.seq); } catch (...) {}
@@ -1313,17 +1300,46 @@ void writer::add_tree(const std::filesystem::path& root, std::string store_prefi
             }
     };
 
+    const std::size_t depth = std::max<std::size_t>(d->opts.pipeline_depth, 1);
+    std::size_t next_consume = 0;
+    tree_item it;
     try {
-        for (std::size_t i = 0; i < items.size(); ++i) {
-            auto& it = items[i];
-            if (it.kind != tree_item::kFile) continue;
-            // Free an in-flight slot if the window is full (submit-order drain;
-            // every item before i was already submitted, so this always ends).
-            while (pipe->in_flight() >= depth)
-                consume_one(items[next_consume++]);
-            it.seq = pipe->submit(it.abs,
-                                  static_cast<std::uint64_t>(it.st.st_size),
-                                  /*follow_symlinks=*/false);
+        if (!pipe) {
+            // Serial fallback (also the reference for determinism tests):
+            // consume each entry the moment the walk discovers it, files
+            // inline (open + streamed add_file_impl).
+            for (auto& rit : items) consume_one(rit); // tar-style root, if any
+            items.clear();
+            while (next_item(it)) {
+                if (it.kind != tree_item::kFile) { consume_meta(it); continue; }
+                int fd = ::open(it.abs.c_str(), O_RDONLY | O_NOFOLLOW);
+                if (fd < 0) {
+                    int e2 = errno;
+                    throw std::system_error(e2, std::generic_category(), "open failed: " + it.abs.string());
+                }
+                d->add_file_impl(it.rel, it.abs,
+                                 static_cast<std::uint64_t>(it.st.st_size), fd);
+            }
+            return;
+        }
+
+        // Phase 3 pipeline, fed by the streaming walk: a file is submitted
+        // the moment it is discovered; when the in-flight window is full the
+        // oldest queued entry is consumed first. Discovery order is the
+        // consumption order either way, so archive bytes stay scheduling-
+        // independent (identical to the serial path — determinism tests).
+        while (next_item(it)) {
+            if (it.kind == tree_item::kFile)
+                // Free an in-flight slot if the window is full (submit-order
+                // drain; every earlier queued file was already submitted, so
+                // this always terminates).
+                while (pipe->in_flight() >= depth)
+                    consume_one(items[next_consume++]);
+            items.push_back(std::move(it));
+            if (items.back().kind != tree_item::kFile) continue;
+            items.back().seq = pipe->submit(items.back().abs,
+                                            static_cast<std::uint64_t>(items.back().st.st_size),
+                                            /*follow_symlinks=*/false);
         }
         while (next_consume < items.size())
             consume_one(items[next_consume++]);
@@ -1331,6 +1347,17 @@ void writer::add_tree(const std::filesystem::path& root, std::string store_prefi
         reap_rest();
         throw;
     }
+}
+
+writer::summary writer::contents() const {
+    summary s;
+    for (const auto& e : d->entries) {
+        const mode_t m = e.mode;
+        if (S_ISDIR(m))       ++s.dirs;
+        else if (S_ISREG(m)) { ++s.files; s.bytes += e.uncompressed_size; }
+        else                  ++s.others;
+    }
+    return s;
 }
 
 void writer::finalize() {
