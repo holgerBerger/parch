@@ -26,6 +26,11 @@ public:
         bool dedup = false;                // enable within-section content dedup
         bool durable = true;               // fsync ordering on finalize/append
         bool sparse = true;                // archive holes as sparse blocks (v0.3)
+        bool xattrs = true;                // probe + capture extended attributes
+                                           // (false skips the listxattr/getxattr
+                                           // round-trips — big on network FSes)
+        bool acls = true;                  // probe + capture POSIX ACLs
+                                           // (false skips the two acl_get RPCs/file)
         bool profile = false;              // collect per-stage create timings;
                                            // report emitted on stderr by finalize(),
                                            // see profile_report()

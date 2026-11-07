@@ -28,6 +28,8 @@ struct options {
     bool        dedup             = false;// enable within-section content dedup
     bool        durable           = true; // fsync ordering on finalize/append
     bool        sparse            = true; // archive holes as v0.3 sparse blocks
+    bool        xattrs            = true; // probe + capture extended attributes
+    bool        acls              = true; // probe + capture POSIX ACLs
     bool        profile           = false;// per-stage create timing report (see profile_report())
 };
 ```
@@ -64,6 +66,14 @@ struct options {
   blocks of equal size, so they dedup against each other. Setting false
   stores hole bytes like any other data and the archive stays format v0.2.
   Honoured on both the pipeline and serial write paths.
+- `xattrs` / `acls` — when true (default) every file entry captures extended
+  attributes and POSIX ACLs. On network filesystems the probes
+  (`llistxattr`/`lgetxattr`, two `acl_get_file` RPCs per file) are pure
+  metadata-server traffic — often the dominant create cost when the answer is
+  "nothing" (scratch Lustre/GPFS without SELinux labels or ACLs). Setting
+  either false skips the probe **and** stores nothing for that class
+  (`xattr_id`/`acl_id` stay 0); extraction then leaves the target's
+  inherited/default ACLs as-is. Symlinks are never probed either way.
 - `profile` — when true, every stage of the creation pipeline is timed
   (source open, xattr/ACL reads, block pread, CRC, XXH3 hashing, compress,
   block-permit wait, tree walk, writer-thread wait, archive pwrite, dedup
@@ -431,6 +441,8 @@ public:
         int block_permits = 96;     // max live blocks in RAM (memory bound)
         int per_file_cap = 2;       // liveness bound per in-flight file
         bool sparse = true;         // emit COMPRESSOR_SPARSE hole blocks
+        bool xattrs = true;         // io worker: read_xattrs per file
+        bool acls = true;           // io worker: read_acl per file
         profile_hooks* prof = nullptr; // optional writer-owned stage timers
     };
     pipeline(options, std::string compressor, int level,
@@ -640,6 +652,8 @@ opts:
       --dedup             within-section content dedup (XXH3-128)
       --no-sync           skip fsync barriers (faster, less durable)
       --no-sparse         store holes as zero-filled blocks (archive stays v0.2)
+      --no-xattr          skip extended-attribute capture (fewer metadata RPCs)
+      --no-acl            skip POSIX ACL capture (fewer metadata RPCs)
   -C, --directory DIR     chdir to DIR before anything: the archive path and all
                           inputs resolve from there (like tar -C; e.g. store the
                           contents of a dir without its name: -C DIR . )

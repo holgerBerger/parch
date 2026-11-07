@@ -46,6 +46,8 @@ struct cli_opts {
     bool dedup = false;
     bool durable = true;
     bool sparse = true;
+    bool xattrs = true;
+    bool acls = true;
     bool threads_given = false;   // reader default = hardware concurrency
     bool profile = false;         // writer/reader options.profile (create/append/extract/verify)
     std::string directory;        // -C: chdir here before resolving any paths
@@ -74,6 +76,8 @@ struct cli_opts {
         "      --dedup             within-section content dedup (XXH3-128)\n"
         "      --no-sync           skip fsync barriers (faster, less durable)\n"
         "      --no-sparse         store holes as zero-filled blocks (archive stays v0.2)\n"
+        "      --no-xattr          skip extended-attribute capture (fewer metadata RPCs)\n"
+        "      --no-acl            skip POSIX ACL capture (fewer metadata RPCs)\n"
         "  -C, --directory DIR     chdir to DIR before anything: the archive path and all\n"
         "                          inputs resolve from there (like tar -C; e.g. store the\n"
         "                          contents of a dir without its name: -C DIR . )\n"
@@ -116,6 +120,8 @@ std::vector<std::string> parse_args(int argc, char** argv, cli_opts& o) {
         else if (a == "--dedup") o.dedup = true;
         else if (a == "--no-sync") o.durable = false;
         else if (a == "--no-sparse") o.sparse = false;
+        else if (a == "--no-xattr") o.xattrs = false;
+        else if (a == "--no-acl") o.acls = false;
         else if (a == "-C" || a == "--directory") o.directory = need_value(i, "-C");
         else if (a == "-v" || a == "--verbose") { o.log_level = spdlog::level::debug; o.verbose = true; }
         else if (a == "-q" || a == "--quiet") o.log_level = spdlog::level::err;
@@ -144,6 +150,8 @@ arch::writer::options writer_opts(const cli_opts& o) {
     w.dedup = o.dedup;
     w.durable = o.durable;
     w.sparse = o.sparse;
+    w.xattrs = o.xattrs;
+    w.acls = o.acls;
     w.profile = o.profile;
     return w;
 }

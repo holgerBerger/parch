@@ -211,13 +211,16 @@ void pipeline::io_worker()
         }
 
         // Metadata reads happen here too — on a network FS these round-trips
-        // are part of what cross-file concurrency hides.
-        try {
-            util::profile::span s(P ? P->meta : nullptr);
-            util::read_xattrs(f->path, f->xattr_blob);
-            util::read_acl(f->path, f->acl_blob);
-        } catch (const std::exception& ex) {
-            SPDLOG_DEBUG("xattr read failed for {}: {}", f->path.c_str(), ex.what());
+        // are part of what cross-file concurrency hides. opts.xattrs/.acls
+        // disable the probes entirely (metadata-server RPCs are precious there).
+        if (m_opts.xattrs || m_opts.acls) {
+            try {
+                util::profile::span s(P ? P->meta : nullptr);
+                if (m_opts.xattrs) util::read_xattrs(f->path, f->xattr_blob);
+                if (m_opts.acls) util::read_acl(f->path, f->acl_blob);
+            } catch (const std::exception& ex) {
+                SPDLOG_DEBUG("xattr read failed for {}: {}", f->path.c_str(), ex.what());
+            }
         }
 
         {

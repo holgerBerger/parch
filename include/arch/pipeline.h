@@ -86,6 +86,8 @@ public:
         int block_permits = 96;     // max live blocks (raw or compressed) in RAM
         int per_file_cap = 2;       // max live blocks owned by one file (liveness bound)
         bool sparse = true;         // emit hole blocks as COMPRESSOR_SPARSE (v0.3)
+        bool xattrs = true;         // io worker: read_xattrs per file
+        bool acls = true;           // io worker: read_acl per file
         profile_hooks* prof = nullptr; // optional stage timers (outlives the pipeline)
     };
 

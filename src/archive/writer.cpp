@@ -384,13 +384,13 @@ void writer::impl::add_file_impl(const std::filesystem::path& name,
     entry.block_list_offset = blocks.size();
 
     // Xattr / ACL blobs live in the string table (xattr_id/acl_id = offset).
-    {
+    if (opts.xattrs) {
         util::profile::span s(T(STG_META));
         std::vector<std::uint8_t> blob;
         util::read_xattrs(full, blob);
         if (!blob.empty()) entry.xattr_id = add_blob(blob);
     }
-    {
+    if (opts.acls) {
         util::profile::span s(T(STG_META));
         std::vector<std::uint8_t> blob;
         util::read_acl(full, blob);
@@ -565,14 +565,18 @@ void writer::impl::add_metadata_entry(const std::filesystem::path& name,
     }
 
     if (!S_ISLNK(st.st_mode)) { // listxattr/setxattr follow symlinks
-        std::vector<std::uint8_t> blob;
-        util::read_xattrs(full, blob);
-        if (!blob.empty()) entry.xattr_id = add_blob(blob);
-        blob.clear();
-        util::read_acl(full, blob);
-        if (!blob.empty()) {
-            blob.push_back('\0');
-            entry.acl_id = add_blob(blob);
+        if (opts.xattrs) {
+            std::vector<std::uint8_t> blob;
+            util::read_xattrs(full, blob);
+            if (!blob.empty()) entry.xattr_id = add_blob(blob);
+        }
+        if (opts.acls) {
+            std::vector<std::uint8_t> blob;
+            util::read_acl(full, blob);
+            if (!blob.empty()) {
+                blob.push_back('\0');
+                entry.acl_id = add_blob(blob);
+            }
         }
     }
 
@@ -593,6 +597,8 @@ io::pipeline* writer::impl::get_pipeline() {
         po.files_in_flight = static_cast<int>(std::max<std::size_t>(opts.pipeline_depth, 1));
         po.compress_threads = std::max(1, opts.threads);
         po.sparse = opts.sparse;
+        po.xattrs = opts.xattrs;
+        po.acls = opts.acls;
         // block_permits / per_file_cap keep their defaults; the constructor
         // scales the pool to the per-file liveness bound.
         if (opts.profile) {

@@ -239,3 +239,52 @@ TEST_CASE("archive: ACLs survive writer→reader roundtrip", "[util][acl][reader
 
     fs::remove_all(rp);
 }
+
+TEST_CASE("archive: xattrs=false / acls=false skip the metadata probes",
+          "[util][acl][xattr][writer]") {
+    namespace fs = std::filesystem;
+    char tmpl[] = "/tmp/opencode/arch_nometa_XXXXXX";
+    const char* root = ::mkdtemp(tmpl);
+    REQUIRE(root != nullptr);
+    const fs::path rp(root), src = rp / "src", arc = rp / "t.arc";
+    fs::create_directories(src);
+    { std::ofstream(src / "f.txt") << "hello"; }
+    REQUIRE(::setxattr((src / "f.txt").c_str(), "user.arch.test",
+                       "value", 5, 0) == 0);
+    if (!probe_set_acl((src / "f.txt").c_str(), ACL_TYPE_ACCESS,
+                       "u::rw-\ng::r--\no::r--\nu:23456:rwx"))
+        SKIP("filesystem lacks POSIX ACL support");
+
+    // Both the pipeline (threads>0) and the serial fallback (threads=0)
+    // honour the flags; run each variant and inspect through the reader.
+    for (int threads : {4, 0}) {
+        fs::remove(arc);
+        {
+            arch::writer::options o;
+            o.threads = threads;
+            o.xattrs = false;
+            o.acls = false;
+            arch::writer w(arc, o);
+            w.add_tree(src);
+            w.finalize();
+        }
+        arch::reader r(arc);
+        CHECK(r.get_xattrs("f.txt").empty());
+        CHECK(r.get_acl("f.txt").empty());
+    }
+
+    // Positive control with default options: both are captured.
+    fs::remove(arc);
+    {
+        arch::writer w(arc);
+        w.add_tree(src);
+        w.finalize();
+    }
+    {
+        arch::reader r(arc);
+        CHECK_FALSE(r.get_xattrs("f.txt").empty());
+        CHECK(r.get_acl("f.txt").find("user:23456:rwx") != std::string::npos);
+    }
+
+    fs::remove_all(rp);
+}

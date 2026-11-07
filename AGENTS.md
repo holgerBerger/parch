@@ -41,8 +41,11 @@ docs/                — format spec, test plan, API reference, benchmarks.md (P
 `src/main.cpp` is the `parch` CLI (Phase 5; "parallel archiver" — the name
 expresses the cross-file worker pipeline): `create` / `append` / `list` /
 `extract`; options map 1:1 to `writer::options` / `reader::options`
-(`-c zstd|none`, `-l`, `-j`, `--depth`, `--dedup`, `--no-sync`, `-C DIR`,
-`-v`/`-q`).
+(`-c zstd|none`, `-l`, `-j`, `--depth`, `--dedup`, `--no-sync`, `--no-xattr`,
+`--no-acl`, `-C DIR`, `-v`/`-q`). `writer::options.xattrs`/`.acls` (default
+true) skip the per-file listxattr/getxattr + acl_get probes when false — a
+metadata-RPC saver for MDS-bound network filesystems (real Lustre create was
+MDS-rate-bound: the probes were 36% of busy time).
 The `parch` target links `archiver_lib` inside a literal
 `-Wl,--whole-archive ... -Wl,--no-whole-archive` pair in CMakeLists — required
 for the `REGISTER_COMPRESSOR` static init (see linking note below).
