@@ -71,6 +71,7 @@ public:
         int compress_threads = 4;   // block-compression pool (writer options.threads)
         int block_permits = 96;     // max live blocks (raw or compressed) in RAM
         int per_file_cap = 2;       // max live blocks owned by one file (liveness bound)
+        bool sparse = true;         // emit hole blocks as COMPRESSOR_SPARSE (v0.3)
     };
 
     /// @param compressor     codec name for the factory registry
@@ -133,6 +134,10 @@ private:
         std::size_t index = 0;
         std::vector<std::uint8_t> data;
         format::digest128 content_id{};
+        // Sparse (hole) block: `data` is empty, `usize` carries the logical
+        // block length; the compression stage emits COMPRESSOR_SPARSE.
+        bool sparse = false;
+        std::uint32_t usize = 0;
     };
 
     void io_worker();

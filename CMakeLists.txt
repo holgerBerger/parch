@@ -90,6 +90,11 @@ add_library(archiver_lib STATIC ${ARCHIVER_SOURCES})
 target_include_directories(archiver_lib PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
+# Internal headers (src/io/sparse.h, src/util/retry.h) — PUBLIC so tests can
+# unit-test them without an include-path patch.
+target_include_directories(archiver_lib PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
 
 target_link_libraries(archiver_lib PUBLIC
     spdlog::spdlog

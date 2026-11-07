@@ -5,6 +5,8 @@
 #include "arch/compressor.h"
 #include "arch/format.h"
 #include "format_parse.h"
+#include "io/sparse.h"
+#include "util/retry.h"
 #include "util/xattr.h"
 #include <spdlog/spdlog.h>
 #include <fcntl.h>
@@ -29,7 +31,7 @@ namespace fs = std::filesystem;
 
 namespace {
 
-constexpr std::uint16_t FORMAT_VERSION = 0x0002;
+constexpr std::uint16_t FORMAT_VERSION = format::FORMAT_VERSION_SPARSE; // accepts <= v0.3
 
 std::string_view zstr(std::string_view table, std::uint64_t off, const char* what) {
     if (off == 0) return {}; // reserved NUL sentinel = "absent"
@@ -73,10 +75,12 @@ struct reader::impl {
         std::vector<std::uint8_t> b(n);
         std::size_t got = 0;
         while (got < n) {
-            ssize_t r = ::pread(fd, b.data() + got, n - got,
-                                static_cast<off_t>(off + got));
+            // Transient network-FS errors (ESTALE/EIO/...) retried with
+            // backoff (Phase 8 item 31).
+            ssize_t r = arch::detail::retry_io([&] {
+                return ::pread(fd, b.data() + got, n - got,
+                               static_cast<off_t>(off + got)); });
             if (r < 0) {
-                if (errno == EINTR) continue;
                 int e = errno;
                 throw std::system_error(e, std::generic_category(),
                                         "pread failed on archive");
@@ -107,7 +111,8 @@ struct reader::impl {
 
     void extract_data(const entry_location& loc, std::int64_t block_first,
                       std::int64_t block_count, const std::filesystem::path& dest,
-                      codec_cache& codecs) const;
+                      codec_cache& codecs, bool sink = false) const;
+    std::vector<std::string> verify_all() const;
     void restore_metadata(const format::file_entry& e,
                           const std::filesystem::path& dest, int fd_at_meta) const;
     const entry_location& find_entry(const std::string& path) const {
@@ -266,12 +271,14 @@ void reader::impl::parse_sections(const std::vector<format::toc_section_ref>& re
 void reader::impl::extract_data(const entry_location& loc, std::int64_t block_first,
                                 std::int64_t block_count,
                                 const std::filesystem::path& dest,
-                                codec_cache& codecs) const
+                                codec_cache& codecs, bool sink) const
 {
     const auto& sec = sections[loc.section];
     const auto& e = sec.entries[loc.index];
 
-    int out = ::open(dest.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    // sink mode (verify): bytes go to /dev/null, holes are not recreated.
+    int out = sink ? ::open("/dev/null", O_WRONLY)
+                   : ::open(dest.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (out < 0)
         throw std::system_error(errno, std::generic_category(),
                                 "cannot create " + dest.string());
@@ -279,18 +286,43 @@ void reader::impl::extract_data(const entry_location& loc, std::int64_t block_fi
     try {
         std::uint32_t file_crc = 0;
         std::uint64_t woff = 0;
+        bool had_sparse = false;
         for (std::int64_t j = 0; j < block_count; ++j) {
             const auto& be = sec.blocks[static_cast<std::size_t>(block_first + j)];
+
+            // v0.3 sparse (hole) block: zero stored bytes, expands to
+            // uncompressed_size zeros. Never read; leave the output hole.
+            if (be.compressor_id == format::COMPRESSOR_SPARSE) {
+                if (footer.version < format::FORMAT_VERSION_SPARSE)
+                    throw std::runtime_error("sparse block in v" +
+                        std::to_string(footer.version) + " archive: " + dest.string());
+                if (be.compressed_size != 0 ||
+                    be.uncompressed_size > format::ARCH_BLOCK_SIZE)
+                    throw std::runtime_error("bogus sparse block entry in " +
+                                             dest.string() + " (block " +
+                                             std::to_string(j) + ")");
+                if (crc32c::Extend(0, nullptr, 0) != be.crc32c)
+                    throw std::runtime_error("sparse block CRC mismatch in " +
+                                             dest.string() + " (block " +
+                                             std::to_string(j) + ")");
+                file_crc = io::sparse::crc_extend_zeros(file_crc, be.uncompressed_size);
+                woff += be.uncompressed_size;
+                had_sparse = true;
+                continue;
+            }
             if (be.compressed_size == 0 || be.uncompressed_size > format::ARCH_BLOCK_SIZE)
-                throw std::runtime_error("bogus block entry in " + dest.string());
+                throw std::runtime_error("bogus block entry in " + dest.string() +
+                                         " (block " + std::to_string(j) + ")");
             // block offsets are section-relative; data region is
             // [data_offset, data_offset + data_size).
             if (be.offset < sec.hdr.data_offset ||
                 be.offset + be.compressed_size > sec.hdr.data_offset + sec.hdr.data_size)
-                throw std::runtime_error("block past section data region in " + dest.string());
+                throw std::runtime_error("block past section data region in " +
+                                         dest.string() + " (block " + std::to_string(j) + ")");
             auto raw_stored = read_at(sec.start + be.offset, be.compressed_size);
             if (crc32c::Crc32c(raw_stored.data(), raw_stored.size()) != be.crc32c)
-                throw std::runtime_error("block CRC mismatch in " + dest.string());
+                throw std::runtime_error("block CRC mismatch in " + dest.string() +
+                                         " (block " + std::to_string(j) + ")");
 
             std::vector<std::uint8_t> plain;
             if (be.compressor_id == format::COMPRESSOR_NONE) {
@@ -323,6 +355,13 @@ void reader::impl::extract_data(const entry_location& loc, std::int64_t block_fi
         if (file_crc != e.checksum)
             throw std::runtime_error("file checksum mismatch for " + dest.string() +
                                      " (corrupt archive?)");
+        // A trailing hole was never pwritten — extend the file so the last
+        // block's zeros actually exist (interior holes already do: pwrite
+        // past a hole leaves it unallocated).
+        if (had_sparse && !sink &&
+            ::ftruncate(out, static_cast<off_t>(woff)) != 0)
+            throw std::system_error(errno, std::generic_category(),
+                                    "ftruncate failed for " + dest.string());
         if (woff != e.uncompressed_size && e.uncompressed_size != 0)
             SPDLOG_WARN("extracted size {} != recorded {} for {}", woff,
                         e.uncompressed_size, dest.c_str());
@@ -613,6 +652,47 @@ void reader::extract_all(std::filesystem::path dest) const {
             util::write_acl(dpath, d->strings(loc.section).substr(e.acl_id));
     }
 }
+
+// verify: read + CRC + decompress every data-bearing entry into the sink.
+// Directories/symlinks/FIFOs/devices carry no blocks (the constructor's
+// metadata CRC already covers their entries).
+std::vector<std::string> reader::impl::verify_all() const {
+    std::vector<std::string> errors;
+    codec_cache codecs;
+    for (std::size_t si = 0; si < sections.size(); ++si) {
+        const auto& sec = sections[si];
+        for (std::size_t ei = 0; ei < sec.entries.size(); ++ei) {
+            const auto& e = sec.entries[ei];
+            if (!S_ISREG(e.mode)) continue;
+            const auto name = zstr(strings(si), e.path_id, "entry path");
+            std::int64_t first = static_cast<std::int64_t>(e.block_list_offset);
+            std::int64_t count = static_cast<std::int64_t>(e.block_count);
+            if (e.link_target_id != 0) { // hardlink: verify via owner blocks
+                const auto owner = std::string(
+                    zstr(strings(si), e.link_target_id, "hardlink target"));
+                try {
+                    const auto& oloc = find_entry(owner);
+                    first = static_cast<std::int64_t>(
+                        sections[oloc.section].entries[oloc.index].block_list_offset);
+                    count = static_cast<std::int64_t>(
+                        sections[oloc.section].entries[oloc.index].block_count);
+                    extract_data(oloc, first, count, name, codecs, /*sink=*/true);
+                } catch (const std::exception& ex) {
+                    errors.push_back(std::string(name) + ": " + ex.what());
+                }
+                continue;
+            }
+            try {
+                extract_data({si, ei}, first, count, name, codecs, /*sink=*/true);
+            } catch (const std::exception& ex) {
+                errors.push_back(std::string(name) + ": " + ex.what());
+            }
+        }
+    }
+    return errors;
+}
+
+std::vector<std::string> reader::verify_all() const { return d->verify_all(); }
 
 std::vector<std::pair<std::string, std::vector<std::uint8_t>>>
 reader::get_xattrs(const std::filesystem::path& arc_path) const {

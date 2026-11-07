@@ -27,6 +27,7 @@ struct options {
     std::size_t pipeline_depth    = 32;   // files in flight in the stat/open/read pipeline
     bool        dedup             = false;// enable within-section content dedup
     bool        durable           = true; // fsync ordering on finalize/append
+    bool        sparse            = true; // archive holes as v0.3 sparse blocks
 };
 ```
 
@@ -53,6 +54,15 @@ struct options {
 - `durable` — when true, `finalize()`/`append()` enforce the write order
   data → fsync → TOC → fsync → TOC table + footer → fsync. Setting false
   trades crash-durability for speed (single fsync at the end).
+- `sparse` — when true (default), blocks of a file whose `fstat` proves it
+  sparse (`st_blocks * 512 < st_size`) are checked with `SEEK_DATA` and whole
+  holes are stored as **v0.3 sparse blocks** (`COMPRESSOR_SPARSE`, zero
+  stored bytes; see `docs/format.md`). Extraction recreates the holes
+  (interior holes stay unallocated; a trailing hole is restored via
+  `ftruncate`). Hole blocks carry the same `content_id` as dense all-zero
+  blocks of equal size, so they dedup against each other. Setting false
+  stores hole bytes like any other data and the archive stays format v0.2.
+  Honoured on both the pipeline and serial write paths.
 
 ### `writer::writer(path, options)`
 
@@ -227,6 +237,22 @@ parallel**, each file's blocks streamed in order). Four waves:
 Paths are resolved through the last-occurrence-wins map, so a
 multi-section (appended) archive extracts its newest versions. Empty archive
 regions never touched. Archive structure preserved rooted at `dest`.
+
+### `std::vector<std::string> verify_all() const`
+
+Full data-integrity check without writing any output: reads and CRC-verifies
+every block of every regular-file and hardlink entry (decompression included)
+into a `/dev/null` sink, then checks each file checksum. Returns one error
+string per failing entry (`"name: reason"`, block index included where
+relevant); empty means the data is intact. Metadata-level validity
+(footer/TOC-table/section CRCs) is already enforced by the constructor, so
+`verify_all()` is the complementary *data-block* pass. Hardlink duplicates
+are verified through their owner's blocks (mirrors `extract_one`).
+
+```cpp
+arch::reader r("backup.arch");
+for (const auto& err : r.verify_all()) std::cerr << err << "\n";
+```
 
 ### `get_xattrs(arc_path)`
 
@@ -543,6 +569,7 @@ usage: arch create  [opts] <archive> <tree|file...>
        arch append  [opts] <archive> <tree|file...>
        arch list    [opts] <archive>
        arch extract [opts] <archive> [dest]      (dest default: .)
+       arch verify  [opts] <archive>             (check all block + file CRCs)
 
 opts:
   -c, --compressor NAME   zstd (default) or none (store)
@@ -551,6 +578,7 @@ opts:
       --depth N           files in flight in the I/O pipeline (default 32)
       --dedup             within-section content dedup (XXH3-128)
       --no-sync           skip fsync barriers (faster, less durable)
+      --no-sparse         store holes as zero-filled blocks (archive stays v0.2)
   -v, --verbose           debug logging
   -q, --quiet             errors only
       --version           print version and exit
@@ -569,6 +597,11 @@ opts:
 - `extract` maps `-j` onto `reader::options.threads` (when given; otherwise
   the reader defaults to hardware concurrency) and runs the four-wave
   `extract_all` pipeline.
+- `verify` runs the constructor's metadata validation plus `reader::verify_all()`;
+  one failing entry per line on **stdout**, summary on stderr; exit `0` when
+  clean, `1` when any entry fails.
+- `--no-sparse` clears `writer::options.sparse` (holes stored densely, archive
+  stays format v0.2).
 
 **Linking note:** the `arch` target wraps `archiver_lib` in a literal
 `-Wl,--whole-archive ... -Wl,--no-whole-archive` pair inside

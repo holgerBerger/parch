@@ -3,6 +3,8 @@
 #include "arch/compressor.h"
 #include "arch/pipeline.h"
 #include "format_parse.h"
+#include "io/sparse.h"
+#include "util/retry.h"
 #ifdef ARCH_WITH_URING
 #include "arch/io_uring_pool.h"
 #include "arch/prefetch.h"
@@ -211,6 +213,10 @@ struct writer::impl {
     // Footer flags inherited from an existing archive via writer::append()
     // (OR-ed into the rewritten footer so DEDUP stays sticky).
     std::uint16_t footer_flags_inherited = 0;
+    // Sticky once any block carries COMPRESSOR_SPARSE (Phase 8): decides
+    // whether the footer advertises format v0.3 instead of v0.2. Inherited
+    // from an appended archive's version so old sparse sections keep it set.
+    bool used_sparse = false;
 
     // Hardlink detection across the whole archive: (dev, ino) → first-relative-path.
     std::map<std::pair<std::uint64_t, std::uint64_t>, std::string> inode_paths;
@@ -356,27 +362,44 @@ void writer::impl::add_file_impl(const std::filesystem::path& name,
 
     std::uint64_t off = 0;
     std::uint32_t file_crc = 0;
+    // Hole scanning only when fstat already proves the file is sparse
+    // (allocated size < apparent size); dense files pay nothing (Phase 8).
+    const bool sparse_file =
+        opts.sparse && file_size > 0 &&
+        static_cast<std::uint64_t>(st.st_blocks) * 512 < file_size;
 
     try {
         while (off < file_size) {
             std::uint64_t bsize = std::min(format::ARCH_BLOCK_SIZE, file_size - off);
+            const bool hole =
+                sparse_file && io::sparse::block_is_hole(src_fd, off, bsize);
 
-            std::vector<std::uint8_t> raw(bsize);
-            ssize_t n = ::pread(src_fd, raw.data(), bsize, off);
-            if (n <= 0) {
-                int e = errno;
-                SPDLOG_ERROR("pread failed for {} at offset {}: {}",
-                             full.c_str(), off, strerror(e));
-                throw std::system_error(e, std::generic_category(), "pread failed");
+            std::vector<std::uint8_t> raw;
+            std::uint64_t n = bsize;
+            if (hole) {
+                // Never read the hole: the checksum chain and dedup identity
+                // cover the implicit zero bytes exactly as a read would.
+                file_crc = io::sparse::crc_extend_zeros(file_crc, bsize);
+            } else {
+                raw.resize(bsize);
+                ssize_t r = detail::retry_io([&] {
+                    return ::pread(src_fd, raw.data(), bsize,
+                                   static_cast<off_t>(off)); });
+                if (r <= 0) {
+                    int e = errno;
+                    SPDLOG_ERROR("pread failed for {} at offset {}: {}",
+                                 full.c_str(), off, strerror(e));
+                    throw std::system_error(e, std::generic_category(), "pread failed");
+                }
+                raw.resize(static_cast<std::size_t>(r));
+                n = static_cast<std::uint64_t>(r);
+                file_crc = crc32c::Extend(file_crc, raw.data(), raw.size());
             }
-            raw.resize(n);
-
-            file_crc = crc32c::Extend(file_crc, raw.data(), raw.size());
 
             // Dedup check (within-section, spec §Deduplication).
             format::digest128 blk_hash{};
             if (opts.dedup) {
-                blk_hash = hash_block(raw);
+                blk_hash = hole ? io::sparse::zero_digest(n) : hash_block(raw);
                 auto hit = dedup_lookup.find(blk_hash);
                 if (hit != dedup_lookup.end()) {
                     // Duplicate: self-describing copy of the owner's fields.
@@ -388,6 +411,8 @@ void writer::impl::add_file_impl(const std::filesystem::path& name,
                     be.content_id        = blk_hash;
                     be.crc32c            = owner.crc32c;
                     be.compressor_id     = owner.compressor_id;
+                    if (be.compressor_id == format::COMPRESSOR_SPARSE)
+                        used_sparse = true;
                     dedup_index[hit->second].ref_count++;
                     blocks.push_back(be);
                     off += n;
@@ -396,9 +421,15 @@ void writer::impl::add_file_impl(const std::filesystem::path& name,
             }
 
             // Compress and stream the block to disk immediately
-            // ("none" → raw pass-through, CRC of the stored bytes).
+            // ("none" → raw pass-through, CRC of the stored bytes;
+            //  hole → COMPRESSOR_SPARSE, zero stored bytes).
             compress::compressed_block cb;
-            if (comp) {
+            if (hole) {
+                cb.data.clear();
+                cb.crc32c = crc32c::Extend(0, nullptr, 0);
+                cb.compressor_id = format::COMPRESSOR_SPARSE;
+                used_sparse = true;
+            } else if (comp) {
                 cb = comp->compress(raw);
             } else {
                 cb.data = std::move(raw);
@@ -495,6 +526,7 @@ io::pipeline* writer::impl::get_pipeline() {
         io::pipeline::options po;
         po.files_in_flight = static_cast<int>(std::max<std::size_t>(opts.pipeline_depth, 1));
         po.compress_threads = std::max(1, opts.threads);
+        po.sparse = opts.sparse;
         // block_permits / per_file_cap keep their defaults; the constructor
         // scales the pool to the per-file liveness bound.
         pipe = std::make_unique<io::pipeline>(
@@ -528,6 +560,8 @@ void writer::impl::consume_pipelined_file(const std::string& rel, std::uint64_t 
                 be.content_id        = pb.content_id;
                 be.crc32c            = owner.crc32c;
                 be.compressor_id     = owner.compressor_id;
+                if (be.compressor_id == format::COMPRESSOR_SPARSE)
+                    used_sparse = true;
                 dedup_index[hit->second].ref_count++;
                 blocks.push_back(be);
                 dup = true;
@@ -544,6 +578,8 @@ void writer::impl::consume_pipelined_file(const std::string& rel, std::uint64_t 
             be.content_id        = pb.content_id;
             be.crc32c            = pb.crc32c;
             be.compressor_id     = pb.compressor_id;
+            if (pb.compressor_id == format::COMPRESSOR_SPARSE)
+                used_sparse = true;
             blocks.push_back(be);
 
             if (opts.dedup) {
@@ -692,7 +728,8 @@ void writer::impl::write_footer()
     std::vector<std::uint8_t> f;
     f.reserve(format::FOOTER_SIZE);
     put_raw(f, "AR01", 4);                                            // 0
-    put_be<std::uint16_t>(f, 0x0002);                                 // 4  version 0.2
+    put_be<std::uint16_t>(f, used_sparse ? format::FORMAT_VERSION_SPARSE
+                                         : format::FORMAT_VERSION_BASE); // 4  version
     put_be<std::uint16_t>(f, static_cast<std::uint16_t>(
         (opts.dedup ? format::FOOTER_FLAG_DEDUP : 0) | footer_flags_inherited)); // 6
     put_be<std::uint64_t>(f, toc_refs.size());                        // 8
@@ -1089,7 +1126,7 @@ writer::writer(std::filesystem::path path, options opts, append_tag)
         if (fcrc != footer.footer_crc)
             throw std::runtime_error("footer self-check CRC mismatch in " + p);
     }
-    if (footer.version > 0x0002)
+    if (footer.version > format::FORMAT_VERSION_SPARSE)
         throw std::runtime_error("unsupported archive format version " +
                                  std::to_string(footer.version));
 
@@ -1181,6 +1218,9 @@ writer::writer(std::filesystem::path path, options opts, append_tag)
     }
     d->footer_flags_inherited =
         footer.flags.dedup() ? format::FOOTER_FLAG_DEDUP : 0;
+    // v0.3 archives keep advertising v0.3 after append (sparse blocks from
+    // the kept sections still need a v0.3-capable reader).
+    d->used_sparse = footer.version >= format::FORMAT_VERSION_SPARSE;
 
     // Discard the old TOC table + footer; the next write starts at EOF again.
     if (::ftruncate(d->arc_fd, static_cast<off_t>(truncate_at)) != 0)

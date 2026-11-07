@@ -58,7 +58,7 @@ compression and random per-file access. See `docs/format.md` for the full spec
 
 | Area | Status |
 |--|--|--|
-| Format spec (`docs/format.md`) | ✅ **Revised to v0.2** (2026-11 freeze): canonical per-field offset tables, 48 B `block_entry` with XXH3-128 `content_id`, 128 B `file_entry` with `symlink_target_id`/`link_target_id`, metadata-only TOC CRC, self-contained sections, durability + zip-slip contracts. `docs/api.md` updated to match. |
+| Format spec (`docs/format.md`) | ✅ **v0.3** (0.2 design freeze 2026-11 + Phase 8 sparse blocks): canonical per-field offset tables, 48 B `block_entry` with XXH3-128 `content_id`, 128 B `file_entry` with `symlink_target_id`/`link_target_id`, metadata-only TOC CRC, self-contained sections, durability + zip-slip contracts. `docs/api.md` updated to match. |
 | Format structs (`include/arch/format.h`) | ✅ **Ported to v0.2** (Phase 1 code half done): `ARCH_BLOCK_SIZE` rename, 48 B `block_entry` with `digest128 content_id`, 128 B `file_entry` with `symlink_target_id`/`link_target_id`, 128 B `toc_header` (codec + level + section_flags + metadata_crc), 32 B `dedup_entry`, endianness dispatch via `__BYTE_ORDER__`; canonical `*_SIZE` constants + `static_assert`s; size tests updated. Serializer (field-by-field writes) is Phase 2. |
 | Compressor interface (`include/arch/compressor.h`) | ✅ Complete — base class + level-taking factory (`make_compressor(name, level)`, spec v0.2) + `REGISTER_COMPRESSOR` macro |
 | zstd implementation | ✅ Compiles & passes roundtrip tests — header self-contained; real APIs (`ZSTD_c_nbWorkers=1`, `ZSTD_c_compressionLevel`, `crc32c::Crc32c/Extend`); level is the constructor arg (pinned per section in Phase 2) |
@@ -69,8 +69,10 @@ compression and random per-file access. See `docs/format.md` for the full spec
 | I/O pipeline (`arch::io::pipeline`) | ✅ **Done (Phase 3)** — `include/arch/pipeline.h` + `src/io/pipeline.cpp`, always built, plain POSIX: `pipeline_depth` files in flight (open+fstat+xattr+pread), `threads` compression workers, bounded memory via `block_permits` with a per-file liveness cap, submit-order consumption, deterministic bytes, failed-file reaping. Benchmarked: 200 MiB / 200-file tree 0.18 s → 0.04 s (page cache); ASan/UBSan-clean. |
 | Xattr/ACL util (`src/util/xattr.cpp`) | ✅ **Done (Phase 7)** — `read_xattrs`/`write_xattrs` via `listxattr`/`getxattr`/`setxattr` (binary blob per spec, `system.posix_acl_*` skipped); `read_acl`/`write_acl` on libacl (access + default ACLs, numeric IDs, mask handled); restore failures on ACL-less filesystems log instead of throwing. |
 | CMake (FetchContent) | ✅ Configures & builds from scratch: policy-version workaround for crc32c, Catch2 `extras/` module path + `include(Catch)`, `spdlog::spdlog` target, `SOURCE_SUBDIR` for zstd (`build/cmake`) and xxHash (`cmake_unofficial`), `option(ARCH_WITH_URING OFF)` gating pool/prefetch sources + tests. |
-| Tests (Catch2) | ✅ **75/75 passing** (default) / **81/81** (`ARCH_WITH_URING=ON`) — includes `test/test_pipeline.cpp` (ordered multi-block delivery, errors, empty files, backpressure bounds, dtor-during-inflight, writer recovery + serial/pipeline byte-identity) and `test/test_reader.cpp` (list roundtrip, extract_all byte-compare + links/xattr/mode/times, data/metadata/footer corruption detection, truncation-point drop, `writer::append` two-section/empty/sticky-DEDUP, dedup + pipelined roundtrips, zip-slip unit tests) and `test/test_cli.cpp` (5 subprocess cases: roundtrip, append-wins, store mode + knobs, error codes/exit statuses, options anywhere) and `test/test_xattr.cpp` `[acl]` cases (trivial-skip, util blob roundtrip, archive→extract ACL equality incl. default ACLs). |
-| CLI (`src/main.cpp`) | ✅ **Done (Phase 5)** — `create`/`append`/`list`/`extract` with codec/level/threads/depth/dedup/durability flags; stderr diagnostics, stdout listings, exit codes 0/1/2; links the static lib with `--whole-archive` (compressor registration); `test/test_cli.cpp` covers roundtrips + error codes end-to-end |
+| Sparse files (`src/io/sparse.h`) | ✅ **Done (Phase 8)** — `SEEK_DATA` hole detection (gated on `st_blocks*512 < st_size`), whole-hole blocks stored as `COMPRESSOR_SPARSE` (zero bytes, format flips to v0.3 only when used, sticky across `append`); hole `content_id` = XXH3-128 of zeros so dense-zero blocks dedup against holes; extraction leaves holes and `ftruncate`s trailing ones. Pipeline + serial paths both honoured. ASan/UBSan/TSan-clean. |
+| Retry + verify (Phase 8) | ✅ **Done** — `src/util/retry.h` `retry_io` (exponential backoff 1→100 ms, 5 attempts, EINTR free) wraps the hot syscalls (pipeline open/fstat/pread, serial pread, reader pread); `reader::verify_all()` + `arch verify` report per-entry block/file CRC failures with block index. |
+| Tests (Catch2) | ✅ **89/89 passing** (default) / **95/95** (`ARCH_WITH_URING=ON`) — includes `test/test_pipeline.cpp` (ordered multi-block delivery, errors, empty files, backpressure bounds, dtor-during-inflight, writer recovery + serial/pipeline byte-identity) and `test/test_reader.cpp` (list roundtrip, extract_all byte-compare + links/xattr/mode/times, data/metadata/footer corruption detection, truncation-point drop, `writer::append` two-section/empty/sticky-DEDUP, dedup + pipelined roundtrips, zip-slip unit tests) and `test/test_cli.cpp` (5 subprocess cases: roundtrip, append-wins, store mode + knobs, error codes/exit statuses, options anywhere) `test/test_xattr.cpp` `[acl]` cases (trivial-skip, util blob roundtrip, archive→extract ACL equality incl. default ACLs), and `test/test_sparse.cpp` (14 cases: hole roundtrips pipeline+serial, trailing-hole ftruncate restore, partial-hole guard, v0.2/v0.3 footer flip + `options.sparse=false`, hole↔zero dedup under store mode, append v0.3 stickiness, sparse helper equivalence, `retry_io` backoff/EINTR/cap semantics, `verify_all` by-name reporting + hardlink dup). |
+| CLI (`src/main.cpp`) | ✅ **Done (Phase 5)** — `create`/`append`/`list`/`extract`/`verify` with codec/level/threads/depth/dedup/durability/sparse flags; stderr diagnostics, stdout listings, exit codes 0/1/2; links the static lib with `--whole-archive` (compressor registration); `test/test_cli.cpp` covers roundtrips + error codes end-to-end |
 | Test plan (`docs/testing.md`) | ✅ Complete — 50+ planned future tests with priorities |
 
 ## Archive format (summary)
@@ -143,8 +145,8 @@ docs/
 
 ## Remaining work (ordered)
 
-> **Phases 0–5, 7 ✅ (2026-11):** the project configures, compiles, and tests
-> green (75/75 default, 81/81 `-DARCH_WITH_URING=ON`); docs, `format.h`, and
+> **Phases 0–5, 7, 8 ✅ (2026-11):** the project configures, compiles, and tests
+> green (89/89 default, 95/95 `-DARCH_WITH_URING=ON`); docs, `format.h`, and
 > tests are on the frozen v0.2 layout; the writer *streams* spec-conformant
 > archives (TOC/footer serialization, dedup, `add_tree`) verified by an
 > independent re-parse test; `add_tree` runs regular files through the
@@ -155,8 +157,11 @@ docs/
 > paired with a working `writer::append()` static factory; and the **Phase 5
 > CLI** (`arch create/append/list/extract`) drives it all end-to-end; and
 > **Phase 7** made POSIX ACLs (access + default) first-class on libacl,
-> archive→extract roundtrip-tested.
-> Remaining: Phase 8 (sparse files, deeper corruption tooling).
+> archive→extract roundtrip-tested; and **Phase 8** made sparse files native
+> (v0.3 `COMPRESSOR_SPARSE` blocks — holes never read or written), added
+> transient-error retry with backoff on the hot syscalls, and a full data
+> `verify` pass (`reader::verify_all()` / `arch verify`).
+> Remaining: Phase 9 (benchmarks + memory profiling) only.
 >
 > **Design decisions frozen (2026-11):** io_uring demoted to an optional
 > backend (`ARCH_WITH_URING`, default OFF) — the primary I/O path is a
@@ -399,14 +404,32 @@ block CRCs + decompress roundtrip, dedup single-store, tree relative paths).
     extract ACL equality (getfacl text diff) + `get_acl()` + no posix_acl in
     the xattr table; skip cleanly (`SKIP()`) on ACL-less filesystems.
 
-### Phase 8: Robustness
-29. **Corruption detection** — reader verifies block CRC32C before
+### Phase 8: Robustness — ✅ DONE (2026-11)
+29. ✅ **Corruption detection** — reader verifies block CRC32C before
     decompressing, file CRC32C after decompression, TOC metadata CRC32C on
-    parse. Report which block/file failed.
-30. **Sparse file support** — detect sparse regions via `SEEK_DATA`/`SEEK_HOLE`,
-    archive holes without reading them (a big win on network FSes too).
-31. **Error recovery** — pipeline worker error propagation, retry with
-    backoff for transient network-FS errors (EIO/EAGAIN/ESTALE on NFS).
+    parse; errors name the file **and the block index** (`"x.bin: block CRC
+    mismatch in x.bin (block 3)"`). New `reader::verify_all()` runs the whole
+    data pass without writing output (`/dev/null` sink, hardlink dups
+    verified through the owner); `arch verify` exposes it (one failing entry
+    per line on stdout, exit 1 on any failure).
+30. ✅ **Sparse file support** — `src/io/sparse.h` + `writer::options.sparse`
+    (default on, CLI `--no-sparse` to opt out): whole-hole blocks (checked via
+    `SEEK_DATA`, only after `fstat` proves the file sparse) become
+    **v0.3 `COMPRESSOR_SPARSE` blocks** — `compressed_size = 0`, never read
+    from disk, expand to zeros at extraction (interior holes stay
+    unallocated; trailing holes restored via `ftruncate`). Hole `content_id`
+    is XXH3-128 of zeros so dense all-zero blocks dedup against holes; file
+    checksums use `crc_extend_zeros` (CRC of zeros without materializing
+    them). Footer advertises `0x0003` only when a sparse block exists (sticky
+    through `writer::append()`); a 12 MiB-hole 20 MiB file archives to ~1.6 KB.
+31. ✅ **Error recovery** — pipeline worker error propagation (was already in
+    place) + `src/util/retry.h::retry_io`: transient network-FS errnos
+    (EIO/EAGAIN/ESTALE/ETIMEDOUT/ENETDOWN/ENETUNREACH/EHOSTDOWN/EBUSY)
+    retried with exponential backoff (1 ms doubling, 100 ms cap, 5 attempts);
+    EINTR retried free of charge; permanent errors surface immediately with
+    their errno. Applied to the pipeline's open/fstat/pread, the serial
+    block-read loop, and the reader's `read_at`. `retry_sleep_count()` is a
+    process-wide test hook proving the path ran without real latency.
 
 ### Phase 9: Performance
 32. **Benchmark suite** — throughput on local SSD, NFS (simulated latency),
@@ -445,8 +468,8 @@ headers). Default builds are plain POSIX — no liburing needed.
 **Requires:** CMake ≥ 3.22, C++20 compiler (the crc32c policy workaround is
 baked into CMakeLists via `CMAKE_POLICY_VERSION_MINIMUM`). liburing headers
 only with `-DARCH_WITH_URING=ON`.
-**Status: builds & tests green** — 40/40 default, 46/46 with the uring flag
-(Phase 0 complete).
+**Status: builds & tests green** — 89/89 default, 95/95 with the uring flag
+(Phases 0–5, 7, 8 complete).
 
 ## Known issues / tech debt
 

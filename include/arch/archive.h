@@ -25,6 +25,7 @@ public:
         std::size_t pipeline_depth = 32;   // files in flight in the I/O pipeline (Phase 3)
         bool dedup = false;                // enable within-section content dedup
         bool durable = true;               // fsync ordering on finalize/append
+        bool sparse = true;                // archive holes as sparse blocks (v0.3)
     };
 
     explicit writer(std::filesystem::path path, options opts = {});
@@ -106,6 +107,13 @@ public:
 
     /// Extract all entries to a base directory.
     void extract_all(std::filesystem::path dest) const;
+
+    /// Verify archive integrity without writing any output: reads and
+    /// CRC-checks every block of every regular-file and hardlink entry
+    /// (decompression included), and checks each file checksum. Returns one
+    /// error string per failing entry — empty vector means the data is
+    /// intact. Metadata-level validity is guaranteed by the constructor.
+    std::vector<std::string> verify_all() const;
 
     /// Get extended attributes for an entry.
     std::vector<std::pair<std::string, std::vector<std::uint8_t>>>

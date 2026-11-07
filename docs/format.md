@@ -1,7 +1,16 @@
 # Archiver Format Specification
 
-**Version 0.2** (design freeze 2026-11 — the 0.1 sketch never produced a real
-archive, so 0.2 is the first binding layout).
+**Version 0.3** (0.2 design freeze 2026-11 — the 0.1 sketch never produced a
+real archive, so 0.2 is the first binding layout; 0.3 adds sparse/hole blocks
+and changes **nothing else**).
+
+**Versioning rule:** an archive is written as v0.2 (`footer.version = 0x0002`)
+unless some block was stored as `COMPRESSOR_SPARSE` (see §Block Entry), in
+which case the footer advertises `0x0003`. A v0.3 archive is byte-identical to
+a v0.2 archive apart from that one field, so readers only need to *accept*
+`<= 0x0003` and understand sparse blocks; `writer::append()` of a v0.3 archive
+keeps advertising v0.3 (sticky) because the kept sections may still contain
+sparse blocks.
 
 ## Overview
 
@@ -105,7 +114,7 @@ header is damaged).
 | Offset | Size | Field | Notes |
 |--------|------|-------|-------|
 | 0 | 4 | magic `"AR01"` | Format identifier |
-| 4 | 2 | version | Major:minor (0.2) |
+| 4 | 2 | version | Major:minor (0.2 or 0.3 — 0.3 only if a sparse block exists) |
 | 6 | 2 | flags | Bitfield: `DEDUP=bit0` (any section uses dedup), `CHECKED=bit1` |
 | 8 | 8 | toc_count | Number of TOC sections |
 | 16 | 8 | toc_table_offset | Offset of TOC table (array of `toc_section_ref`) |
@@ -208,16 +217,26 @@ dedup index   (optional, sorted by content_hash)
 | Offset | Size | Field | Notes |
 |--------|------|-------|-------|
 | 0 | 8 | offset | Section-relative offset of the compressed data (from this section's `toc_header`). **Never** crosses section boundaries — dedup duplicates point at an earlier `block_entry` in the *same* section. |
-| 8 | 4 | compressed_size | Bytes stored on disk |
+| 8 | 4 | compressed_size | Bytes stored on disk. **0 for `COMPRESSOR_SPARSE` blocks** (v0.3) — nothing is stored; the block expands to `uncompressed_size` zero bytes at extraction. |
 | 12 | 4 | uncompressed_size | ≤ `ARCH_BLOCK_SIZE` (4 MiB) |
 | 16 | 16 | content_id | XXH3-**128** of uncompressed block; all-zero when dedup disabled. 128-bit (not 64) because a 64-bit collision silently substitutes the wrong block's data with no stored checksum able to notice. |
 | 32 | 4 | crc32c | CRC32C of the compressed bytes |
-| 36 | 1 | compressor_id | Codec for this block (see registry) |
+| 36 | 1 | compressor_id | Codec for this block (see registry). `0x02` = `COMPRESSOR_SPARSE` (v0.3): an unbroken hole; `crc32c` is the CRC32C of zero bytes, `content_id` is XXH3-128 of `uncompressed_size` zeros (so dense all-zero blocks and holes dedup against each other). |
 | 37 | 11 | reserved | Zero-filled |
 
 A duplicate block (dedup hit) stores the **same** `offset`, `compressed_size`,
 `crc32c`, and `compressor_id` as the owning block entry — a reader can resolve
 it from the `block_entry` alone, without consulting the dedup index.
+
+**Sparse blocks (v0.3).** The writer classifies a block as a hole only when
+the *whole* block range is unallocated (`SEEK_DATA` from the block start lands
+at or past the block end, filesystems without `SEEK_HOLE` support never
+classify); partial holes are stored normally. Detection runs only after
+`fstat` proves the file is sparse (`st_blocks * 512 < st_size`), so dense
+files pay nothing. A reader must reject a `COMPRESSOR_SPARSE` block with
+`compressed_size != 0` or a `crc32c` that is not the CRC of zero bytes, and
+extract it by advancing the output offset (leaving the hole) — after the last
+block, `ftruncate` to the total size so a trailing hole is preserved.
 
 ### String table
 
@@ -275,6 +294,7 @@ Last block of a file may be smaller.
 |----|------|-------|
 | 0x00 | none | No compression (pass-through) |
 | 0x01 | zstd | Zstandard, frame stored as-is |
+| 0x02 | sparse | v0.3 pseudo-codec: hole block, `compressed_size = 0`, expands to zeros. Never registered as a section-default codec — only appears in `block_entry.compressor_id`. |
 | 0x10 | reserved | User-defined / future extensibility starts here |
 
 The `compressor_id` is stored per-block so different files can use different

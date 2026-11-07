@@ -18,6 +18,12 @@ drive individual CTest entries.
 | `test_endian.cpp` | `htobe*/betoh*` roundtrip for 8/4/2-byte values, zero preservation. |
 | `test_dedup_index.cpp` | sorted `dedup_entry` vector + binary-search lookup, empty-case, struct size. |
 | `test_footer_serialize.cpp` | footer all-zero defaults, memcpy roundtrip of every field. |
+| `test_toc_serialize.cpp` | `toc_header` / `toc_section_ref` v0.2 layouts, placeholder serializers. |
+| `test_writer_serialize.cpp` | independent re-parse of writer output: header/section/entry/block/string-table bytes against the spec offset tables, section CRCs. |
+| `test_pipeline.cpp` | `io::pipeline` consumption contract: multi-file submit/next_block/release ordering, bounded permits, error propagation, serial fallback equivalence. |
+| `test_reader.cpp` | reader validation chain (footer/TOC/section CRCs, truncation tolerance), `list()`, `extract_all` wave order, symlink/hardlink/FIFO/device restore, zip-slip guard, corruption detection. |
+| `test_sparse.cpp` | Phase 8: sparse hole roundtrips (pipeline + serial), v0.3 footer flip + `--no-sparse`, trailing-hole `ftruncate`, hole↔zero-block dedup, append v0.3 stickiness, `block_is_hole`/`zero_digest`/`crc_extend_zeros`, `retry_io` backoff semantics, `verify_all` error reporting (`[sparse][retry][verify][dedup][append]`). |
+| `test_cli.cpp` | `arch create/append/list/extract/verify` subprocess behaviour: option handling, exit codes, roundtrips incl. sparse inputs. |
 
 ## Future tests (to implement as code is written)
 

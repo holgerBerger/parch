@@ -32,6 +32,15 @@ namespace arch::format {
 constexpr std::size_t ARCH_BLOCK_SIZE = 4ULL * 1024 * 1024; // 4 MiB
 constexpr std::uint8_t COMPRESSOR_NONE = 0x00;
 constexpr std::uint8_t COMPRESSOR_ZSTD  = 0x01;
+// v0.3: sparse (hole) block — stores 0 bytes (compressed_size == 0),
+// expands to uncompressed_size zero bytes at extraction. Not a codec:
+// never passed to make_compressor_by_id.
+constexpr std::uint8_t COMPRESSOR_SPARSE = 0x02;
+
+// Format versions (footer::version). Archives stay 0x0002 unless a v0.3
+// feature (sparse blocks) is actually used, then 0x0003.
+constexpr std::uint16_t FORMAT_VERSION_BASE = 0x0002;
+constexpr std::uint16_t FORMAT_VERSION_SPARSE = 0x0003;
 
 // On-disk record sizes (docs/format.md v0.2)
 constexpr std::size_t ARCHIVE_HEADER_SIZE = 16;

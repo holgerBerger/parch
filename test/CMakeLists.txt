@@ -14,6 +14,7 @@ set(ARCH_TEST_SOURCES
     test_writer_serialize.cpp
     test_pipeline.cpp
     test_reader.cpp
+    test_sparse.cpp
     test_cli.cpp
 )
 

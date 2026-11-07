@@ -40,6 +40,7 @@ struct cli_opts {
     std::size_t depth = 32;       // pipeline_depth
     bool dedup = false;
     bool durable = true;
+    bool sparse = true;
     bool threads_given = false;   // reader default = hardware concurrency
     // ui
     spdlog::level::level_enum log_level = spdlog::level::info;
@@ -53,6 +54,7 @@ struct cli_opts {
         "       arch append  [opts] <archive> <tree|file...>\n"
         "       arch list    [opts] <archive>\n"
         "       arch extract [opts] <archive> [dest]      (dest default: .)\n"
+        "       arch verify  [opts] <archive>             (check all block + file CRCs)\n"
         "\nopts:\n"
         "  -c, --compressor NAME   zstd (default) or none (store)\n"
         "  -l, --level N           compression level (default 3)\n"
@@ -60,6 +62,7 @@ struct cli_opts {
         "      --depth N           files in flight in the I/O pipeline (default 32)\n"
         "      --dedup             within-section content dedup (XXH3-128)\n"
         "      --no-sync           skip fsync barriers (faster, less durable)\n"
+        "      --no-sparse         store holes as zero-filled blocks (archive stays v0.2)\n"
         "  -v, --verbose           debug logging\n"
         "  -q, --quiet             errors only\n"
         "      --version           print version and exit\n"
@@ -96,6 +99,7 @@ std::vector<std::string> parse_args(int argc, char** argv, cli_opts& o) {
         else if (a == "--depth") o.depth = static_cast<std::size_t>(parse_u64(need_value(i, "--depth"), "--depth"));
         else if (a == "--dedup") o.dedup = true;
         else if (a == "--no-sync") o.durable = false;
+        else if (a == "--no-sparse") o.sparse = false;
         else if (a == "-v" || a == "--verbose") o.log_level = spdlog::level::debug;
         else if (a == "-q" || a == "--quiet") o.log_level = spdlog::level::err;
         else if (a == "-h" || a == "--help") { usage_error("", 0); }
@@ -122,6 +126,7 @@ arch::writer::options writer_opts(const cli_opts& o) {
     w.pipeline_depth = o.depth;
     w.dedup = o.dedup;
     w.durable = o.durable;
+    w.sparse = o.sparse;
     return w;
 }
 
@@ -279,6 +284,21 @@ int cmd_extract(std::vector<std::string> args, const cli_opts& o) {
     return 0;
 }
 
+int cmd_verify(std::vector<std::string> args, const cli_opts& /*o*/) {
+    if (args.size() != 1) usage_error("usage: arch verify <archive>");
+    arch::reader r(args.front());          // constructor = metadata validation
+    const auto errors = r.verify_all();    // reads + CRCs every data block
+    for (const auto& e : errors)
+        std::printf("%s\n", e.c_str());    // failing entries on stdout, one/line
+    if (errors.empty()) {
+        spdlog::info("OK — all entries verified: {}", args.front());
+        return 0;
+    }
+    spdlog::error("{} entr(ies) failed verification in {}", errors.size(),
+                  args.front());
+    return 1;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -298,6 +318,7 @@ int main(int argc, char** argv) {
         if (cmd == "append") return cmd_write(true, std::move(args), o);
         if (cmd == "list")   return cmd_list(std::move(args), o);
         if (cmd == "extract") return cmd_extract(std::move(args), o);
+        if (cmd == "verify")  return cmd_verify(std::move(args), o);
         usage_error("unknown command: " + cmd);
     } catch (const std::exception& e) {
         spdlog::error("{}", e.what());

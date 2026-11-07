@@ -1,5 +1,7 @@
 #include "arch/pipeline.h"
 #include "arch/compressor.h"
+#include "io/sparse.h"
+#include "util/retry.h"
 #include "util/xattr.h"
 #include <spdlog/spdlog.h>
 #include <xxhash.h>
@@ -175,8 +177,9 @@ void pipeline::io_worker()
             f = front.second;
         }
 
-        int fd = ::open(f->path.c_str(),
-                        O_RDONLY | (f->follow_symlinks ? 0 : O_NOFOLLOW));
+        int fd = static_cast<int>(arch::detail::retry_io(
+            [&] { return ::open(f->path.c_str(),
+                                O_RDONLY | (f->follow_symlinks ? 0 : O_NOFOLLOW)); }));
         if (fd < 0) {
             int e = errno;
             std::lock_guard lk(m_mtx);
@@ -187,7 +190,7 @@ void pipeline::io_worker()
         }
 
         struct stat st{};
-        if (::fstat(fd, &st) != 0) {
+        if (arch::detail::retry_io([&] { return ::fstat(fd, &st); }) != 0) {
             int e = errno;
             ::close(fd);
             std::lock_guard lk(m_mtx);
@@ -220,6 +223,11 @@ void pipeline::io_worker()
 
         std::uint64_t off = 0;
         const std::uint64_t size = static_cast<std::uint64_t>(st.st_size);
+        // Hole scanning only when fstat already proves the file is sparse
+        // (allocated size < apparent size); dense files pay nothing.
+        const bool sparse_file =
+            m_opts.sparse && size > 0 &&
+            static_cast<std::uint64_t>(st.st_blocks) * 512 < size;
         std::uint32_t fcrc = 0;
         std::size_t idx = 0;
         std::error_code err;
@@ -241,26 +249,44 @@ void pipeline::io_worker()
                 f->permits_held++;
             }
 
-            std::vector<std::uint8_t> raw(bsize);
-            ssize_t n = ::pread(fd, raw.data(), bsize, static_cast<off_t>(off));
-            if (n <= 0) {
-                int e = errno;
-                std::lock_guard lk(m_mtx);
-                f->permits_held--; // no block was queued
-                m_permits_used--;
-                if (n < 0)
-                    err = std::make_error_code(static_cast<std::errc>(e ? e : EIO));
-                break; // n == 0: file shrank — clean end of blocks
-            }
-            raw.resize(static_cast<std::size_t>(n));
-
-            fcrc = crc32c::Extend(fcrc, raw.data(), raw.size());
+            const bool hole =
+                sparse_file && sparse::block_is_hole(fd, off, bsize);
 
             raw_block rb;
             rb.seq = seq;
             rb.index = idx;
-            rb.content_id = m_dedup ? xxh3_128(raw) : format::digest128{};
-            rb.data = std::move(raw);
+            std::size_t consumed = bsize; // bytes of the file this block covers
+
+            if (hole) {
+                // Whole block inside a hole: never read it. The file-checksum
+                // chain and (when enabled) the dedup identity still cover the
+                // zero bytes, matching what reading zeros would produce.
+                rb.sparse = true;
+                rb.usize = static_cast<std::uint32_t>(bsize);
+                fcrc = sparse::crc_extend_zeros(fcrc, bsize);
+                rb.content_id = m_dedup ? sparse::zero_digest(bsize)
+                                        : format::digest128{};
+            } else {
+                std::vector<std::uint8_t> raw(bsize);
+                ssize_t n = arch::detail::retry_io(
+                    [&] { return ::pread(fd, raw.data(), bsize,
+                                         static_cast<off_t>(off)); });
+                if (n <= 0) {
+                    int e = errno;
+                    std::lock_guard lk(m_mtx);
+                    f->permits_held--; // no block was queued
+                    m_permits_used--;
+                    if (n < 0)
+                        err = std::make_error_code(static_cast<std::errc>(e ? e : EIO));
+                    break; // n == 0: file shrank — clean end of blocks
+                }
+                raw.resize(static_cast<std::size_t>(n));
+                consumed = static_cast<std::size_t>(n);
+
+                fcrc = crc32c::Extend(fcrc, raw.data(), raw.size());
+                rb.content_id = m_dedup ? xxh3_128(raw) : format::digest128{};
+                rb.data = std::move(raw);
+            }
 
             {
                 std::lock_guard lk(m_mtx);
@@ -270,7 +296,7 @@ void pipeline::io_worker()
             }
             m_cv.notify_all();
 
-            off += static_cast<std::uint64_t>(n);
+            off += static_cast<std::uint64_t>(consumed);
             idx++;
         }
         ::close(fd);
@@ -322,10 +348,16 @@ void pipeline::compress_worker()
         }
 
         pipeline_block blk;
-        blk.uncompressed_size = static_cast<std::uint32_t>(rb.data.size());
+        blk.uncompressed_size = rb.sparse ? rb.usize
+                                          : static_cast<std::uint32_t>(rb.data.size());
         blk.content_id = rb.content_id;
         try {
-            if (m_use_compression) {
+            if (rb.sparse) {
+                // Hole block: 0 stored bytes; id says "expand to zeros".
+                blk.compressed.clear();
+                blk.crc32c = crc32c::Crc32c(blk.compressed.data(), 0);
+                blk.compressor_id = format::COMPRESSOR_SPARSE;
+            } else if (m_use_compression) {
                 if (!comp) comp = compress::make_compressor(m_compressor, m_level);
                 auto cb = comp->compress(rb.data);
                 blk.compressed = std::move(cb.data);
