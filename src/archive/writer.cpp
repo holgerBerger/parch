@@ -1131,7 +1131,7 @@ void writer::add_file(std::filesystem::path path, std::string_view data) {
     d->entries.push_back(entry);
 }
 
-void writer::add_tree(const std::filesystem::path& root) {
+void writer::add_tree(const std::filesystem::path& root, std::string store_prefix) {
     if (d->finalized) throw std::runtime_error("writer already finalized");
     impl::wall_rec wall(&*d);
 
@@ -1140,13 +1140,27 @@ void writer::add_tree(const std::filesystem::path& root) {
         throw std::system_error(ENOTDIR, std::generic_category(),
                                 "add_tree requires a directory: " + root.string());
     }
+    // tar-style prefix: plain relative path, no "." / ".." elements (the
+    // format rejects ".." at extraction; "." would make sloppy duplicate names).
+    while (store_prefix.size() > 1 && store_prefix.back() == '/') store_prefix.pop_back();
+    if (!store_prefix.empty()) {
+        const std::filesystem::path pp(store_prefix);
+        bool bad = pp.is_absolute() || pp.root_name() != "" || store_prefix.front() == '/';
+        for (const auto& c : pp)
+            if (c == "." || c == ".." || c == "/") bad = true;
+        if (bad)
+            throw std::runtime_error("add_tree: store_prefix must be a plain "
+                                     "relative path: " + store_prefix);
+    }
     d->ensure_section();
 
     namespace fs = std::filesystem;
     // Deterministic depth-first walk (names sorted per directory). Archive
-    // paths are relative to `root` (frozen decision); the root itself is not
-    // stored as an entry. The walk only collects jobs; consumption happens in
-    // the exact same order afterwards, so output is scheduling-independent.
+    // paths are relative to `root` (frozen decision) unless `store_prefix` is
+    // given, in which case every name is prefixed and the root itself becomes
+    // a directory entry (tar-style). The walk only collects jobs; consumption
+    // happens in the exact same order afterwards, so output is
+    // scheduling-independent.
     struct tree_item {
         fs::path abs;
         std::string rel;
@@ -1175,7 +1189,19 @@ void writer::add_tree(const std::filesystem::path& root) {
             stack.emplace_back(fs::absolute(it->second.path()), it->first);
     };
 
-    walk_dir(fs::absolute(root), std::string());
+    walk_dir(fs::absolute(root), store_prefix);
+
+    if (!store_prefix.empty()) {
+        // tar stores the top directory first — mirror that: the root itself
+        // is a metadata entry under its stored name (pushed before the walk
+        // fills `items`, so it consumes first).
+        tree_item rit;
+        rit.abs = fs::absolute(root);
+        rit.rel = store_prefix;
+        rit.st = rst;
+        rit.kind = tree_item::kMeta;
+        items.push_back(std::move(rit));
+    }
 
     {
         // readdir + lstat + readlink per entry: on a network FS this is a full

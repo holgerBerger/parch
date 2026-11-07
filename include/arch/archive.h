@@ -52,7 +52,15 @@ public:
     /// nodes (metadata-only with rdev). Names are stored relative to `root`;
     /// the root itself is not an entry. Walk order is deterministic
     /// (alphabetical per directory).
-    void add_tree(const std::filesystem::path& root);
+    ///
+    /// With a non-empty `store_prefix` (tar-style storage of the top level):
+    /// the root itself becomes a directory entry named `store_prefix` and
+    /// every descendant is stored under `store_prefix/...`. The prefix must
+    /// be a plain relative path without "." / ".." components (throws
+    /// std::runtime_error otherwise); intermediate directories of a
+    /// multi-component prefix need not exist as entries — extraction creates
+    /// them.
+    void add_tree(const std::filesystem::path& root, std::string store_prefix = {});
 
     /// Finalize: write TOC section + footer.
     void finalize();

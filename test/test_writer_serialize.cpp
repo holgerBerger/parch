@@ -335,3 +335,96 @@ TEST_CASE("writer add_tree: dirs, symlinks, hardlinks, relative paths",
     fs::remove_all(root);
     fs::remove(arc);
 }
+
+TEST_CASE("writer add_tree: tar-style store_prefix", "[writer][serialize][tree]") {
+    namespace fs = std::filesystem;
+    const auto root = fs::temp_directory_path() / "arch_p2_prefix";
+    fs::remove_all(root);
+    fs::create_directories(root / "sub");
+    {
+        std::ofstream(root / "a.txt") << "alpha contents";
+        std::ofstream(root / "sub" / "b.txt") << "beta contents, longer than alpha\n";
+    }
+    fs::create_hard_link(root / "a.txt", root / "a_hard.txt");
+    fs::create_symlink("a.txt", root / "link_to_a");
+
+    const auto arc = fs::temp_directory_path() / "arch_p2_prefix.arc";
+    const auto arc_serial = fs::temp_directory_path() / "arch_p2_prefix_serial.arc";
+    {
+        arch::writer w(arc);
+        w.add_tree(root, "proj");
+        w.finalize();
+    }
+
+    arc_file f(arc);
+    const auto sz = f.size();
+    auto ft = f.read(sz - format::FOOTER_SIZE, format::FOOTER_SIZE);
+    auto table = f.read(be64(ft.data() + 16), format::TOC_SECTION_REF_SIZE);
+    const std::uint64_t sec = be64(table.data());
+    auto th = f.read(sec, format::TOC_HEADER_SIZE);
+    const std::uint8_t* hp = th.data();
+    const std::uint64_t entry_count = be64(hp + 4);
+    auto ftbl = f.read(sec + be64(hp + 20), entry_count * format::FILE_ENTRY_SIZE);
+    auto strs = f.read(sec + be64(hp + 52), be64(hp + 60));
+    auto str_at = [&](std::uint64_t id) {
+        return std::string(reinterpret_cast<const char*>(strs.data()) + id);
+    };
+
+    std::map<std::string, parsed_entry> by_name;
+    for (std::uint64_t i = 0; i < entry_count; ++i) {
+        auto e = parse_file_entry(ftbl.data() + i * format::FILE_ENTRY_SIZE);
+        by_name[str_at(e.path_id)] = e;
+    }
+    REQUIRE(by_name.size() == entry_count);
+    // Everything moves under "proj/", and the root itself is now an entry —
+    // stored FIRST (tar lists the top dir first).
+    REQUIRE(str_at(parse_file_entry(ftbl.data()).path_id) == "proj");
+    REQUIRE((by_name["proj"].mode & S_IFMT) == S_IFDIR);
+    REQUIRE(by_name.count("proj/a.txt") == 1);
+    REQUIRE(by_name.count("proj/sub/b.txt") == 1);
+    REQUIRE(by_name.count("a.txt") == 0);
+    // Hardlink owner reference carries the prefix; symlink target does not
+    // (it is a raw link string).
+    REQUIRE(str_at(by_name["proj/a_hard.txt"].link_target_id) == "proj/a.txt");
+    REQUIRE(str_at(by_name["proj/link_to_a"].symlink_target_id) == "a.txt");
+
+    // Pipelined and serial prefixed writes stay byte-identical.
+    {
+        arch::writer::options o;
+        o.threads = 0;
+        arch::writer w(arc_serial, o);
+        w.add_tree(root, "proj");
+        w.finalize();
+    }
+    const arc_file f_serial(arc_serial);
+    CHECK(f.read(0, sz) == f_serial.read(0, f_serial.size()));
+
+    // Bad prefixes rejected (format stores relative names only).
+    {
+        arch::writer w(fs::temp_directory_path() / "arch_p2_prefix_bad.arc");
+        CHECK_THROWS_AS(w.add_tree(root, "/proj"), std::runtime_error);
+        CHECK_THROWS_AS(w.add_tree(root, "../proj"), std::runtime_error);
+        CHECK_THROWS_AS(w.add_tree(root, "a/./b"), std::runtime_error);
+    }
+    fs::remove(fs::temp_directory_path() / "arch_p2_prefix_bad.arc");
+
+    // A multi-component prefix extracts fine even though intermediate dirs
+    // ("top") are not entries themselves — extraction creates parents.
+    const auto arc_nest = fs::temp_directory_path() / "arch_p2_prefix_nest.arc";
+    {
+        arch::writer w(arc_nest);
+        w.add_tree(root, "top/proj/"); // trailing '/' is stripped
+        w.finalize();
+    }
+    const auto dest = fs::temp_directory_path() / "arch_p2_prefix_dest";
+    fs::remove_all(dest);
+    arch::reader(arc_nest).extract_all(dest);
+    CHECK(fs::exists(dest / "top/proj/a.txt"));
+    CHECK(fs::exists(dest / "top/proj/sub/b.txt"));
+    fs::remove_all(dest);
+    fs::remove(arc_nest);
+
+    fs::remove_all(root);
+    fs::remove(arc);
+    fs::remove(arc_serial);
+}

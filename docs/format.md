@@ -243,7 +243,9 @@ block, `ftruncate` to the total size so a trailing hole is preserved.
 Concatenated NUL-terminated UTF-8 byte strings: entry paths (relative),
 symlink targets, ACL text, xattr blobs. Byte 0 is a reserved `NUL` sentinel so
 that offset 0 always means "absent" in reference fields. Paths are stored
-**relative to the `add_tree()` root**; absolute paths are invalid input for the
+**relative to the `add_tree()` root** (or, with the optional `store_prefix`,
+under that single relative name which also appears as the root's own directory
+entry — tar-style); absolute paths are invalid input for the
 writer, and the reader must reject any name containing `..` path elements or a
 leading `/` (zip-slip guard) at extraction.
 

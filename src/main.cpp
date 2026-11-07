@@ -8,9 +8,11 @@
  *
  * Writer/reader options map 1:1 to arch::writer::options /
  * arch::reader::options (docs/api.md). Paths that are directories go through
- * add_tree (names stored relative to the directory); plain file arguments are
- * stored by their basename (writer::add_file semantics — same-basename files
- * from different directories collide, like tar without leading dirs).
+ * add_tree with tar-like naming: the directory's own name is included
+ * ("dir" → "dir/..." entries); pass "." (typically with -C) to store only the
+ * contents. Plain file arguments are stored by their basename
+ * (writer::add_file semantics — same-basename files from different
+ * directories collide, like tar without leading dirs).
  */
 #include "arch/archive.h"
 #include "arch/compressor.h"
@@ -43,6 +45,7 @@ struct cli_opts {
     bool sparse = true;
     bool threads_given = false;   // reader default = hardware concurrency
     bool profile = false;         // writer/reader options.profile (create/append/extract/verify)
+    std::string directory;        // -C: chdir here before resolving any paths
     // ui
     spdlog::level::level_enum log_level = spdlog::level::info;
 };
@@ -67,6 +70,9 @@ struct cli_opts {
         "      --dedup             within-section content dedup (XXH3-128)\n"
         "      --no-sync           skip fsync barriers (faster, less durable)\n"
         "      --no-sparse         store holes as zero-filled blocks (archive stays v0.2)\n"
+        "  -C, --directory DIR     chdir to DIR before anything: the archive path and all\n"
+        "                          inputs resolve from there (like tar -C; e.g. store the\n"
+        "                          contents of a dir without its name: -C DIR . )\n"
         "  -v, --verbose           debug logging\n"
         "  -q, --quiet             errors only\n"
         "      --version           print version and exit\n"
@@ -105,6 +111,7 @@ std::vector<std::string> parse_args(int argc, char** argv, cli_opts& o) {
         else if (a == "--dedup") o.dedup = true;
         else if (a == "--no-sync") o.durable = false;
         else if (a == "--no-sparse") o.sparse = false;
+        else if (a == "-C" || a == "--directory") o.directory = need_value(i, "-C");
         else if (a == "-v" || a == "--verbose") o.log_level = spdlog::level::debug;
         else if (a == "-q" || a == "--quiet") o.log_level = spdlog::level::err;
         else if (a == "-h" || a == "--help") { usage_error("", 0); }
@@ -197,6 +204,25 @@ std::string human(std::uint64_t bytes) {
 
 // ---- commands ----
 
+// tar-like naming for a directory argument: store it under its own final
+// path component ("dir", "some/dir", "/abs/dir", "dir/" all → "dir"; ".." →
+// the resolved parent's name). A final "." component ("." or "dir/.") opts
+// out — contents-only storage, the add_tree default — which is how
+// `arch create a.arc -C DIR .`-style workflows name DIR's contents directly.
+std::string tree_prefix(const std::string& a) {
+    namespace fs = std::filesystem;
+    std::string s = a;
+    while (s.size() > 1 && s.back() == '/') s.pop_back(); // "dir/" → "dir"
+    const fs::path p(s);
+    if (p.filename() == ".") return {};
+    std::error_code ec;
+    fs::path norm = fs::absolute(p, ec);
+    if (!ec) norm = norm.lexically_normal();
+    std::string name = norm.filename().string();
+    if (name.empty() || name == "." || name == "..") return {}; // "/" etc.
+    return name;
+}
+
 int cmd_write(bool append_mode, std::vector<std::string> args, const cli_opts& o) {
     if (args.size() < 2) usage_error("need <archive> and at least one path");
     const std::filesystem::path arc = args.front();
@@ -215,12 +241,14 @@ int cmd_write(bool append_mode, std::vector<std::string> args, const cli_opts& o
     if (append_mode) {
         auto w = arch::writer::append(arc, writer_opts(o));
         for (const auto& a : args)
-            std::filesystem::is_directory(a) ? w.add_tree(a) : w.add_file(a);
+            std::filesystem::is_directory(a) ? w.add_tree(a, tree_prefix(a))
+                                             : w.add_file(a);
         w.finalize();
     } else {
         arch::writer w(arc, writer_opts(o));
         for (const auto& a : args)
-            std::filesystem::is_directory(a) ? w.add_tree(a) : w.add_file(a);
+            std::filesystem::is_directory(a) ? w.add_tree(a, tree_prefix(a))
+                                             : w.add_file(a);
         w.finalize();
     }
     const double secs = elapsed_s(t0);
@@ -326,6 +354,9 @@ int main(int argc, char** argv) {
     std::vector<std::string> args(pos.begin() + 1, pos.end());
 
     try {
+        if (!o.directory.empty())
+            std::filesystem::current_path(o.directory); // like tar -C: everything
+                                                       // after this resolves from there
         if (cmd == "create") return cmd_write(false, std::move(args), o);
         if (cmd == "append") return cmd_write(true, std::move(args), o);
         if (cmd == "list")   return cmd_list(std::move(args), o);

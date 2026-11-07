@@ -102,17 +102,17 @@ TEST_CASE("cli: create + list + extract roundtrip", "[cli]") {
     r = run(cli("list '" + arc.string() + "'"));
     REQUIRE(r.code == 0);
     CHECK(contains(r.out, "-rw"));
-    CHECK(contains(r.out, "a.txt"));
-    CHECK(contains(r.out, "deep/b.bin"));
-    CHECK(contains(r.out, "link.txt -> a.txt"));
+    CHECK(contains(r.out, "src/a.txt"));        // tar-like: top dir included
+    CHECK(contains(r.out, "src/deep/b.bin"));
+    CHECK(contains(r.out, "src/link.txt -> a.txt"));
     CHECK(contains(r.out, "drwx"));
 
     const auto out = td.path / "out";
     r = run(cli("extract -q '" + arc.string() + "' '" + out.string() + "'"));
     REQUIRE(r.code == 0);
-    CHECK(read_file(out / "a.txt") == "alpha contents");
-    CHECK(read_file(out / "deep/b.bin") == std::string(70000, 'Z'));
-    CHECK(std::filesystem::read_symlink(out / "link.txt") == "a.txt");
+    CHECK(read_file(out / "src/a.txt") == "alpha contents");
+    CHECK(read_file(out / "src/deep/b.bin") == std::string(70000, 'Z'));
+    CHECK(std::filesystem::read_symlink(out / "src/link.txt") == "a.txt");
 }
 
 TEST_CASE("cli: append adds entries, extraction takes newest", "[cli]") {
@@ -156,7 +156,7 @@ TEST_CASE("cli: store mode (-c none) and pipeline knobs", "[cli]") {
     REQUIRE(run(cli("extract -q '" + arc.string() + "' '" + out.string() + "'")).code == 0);
     bool all_ok = true;
     for (int i = 0; i < 25; ++i)
-        if (read_file(out / ("f" + std::to_string(i) + ".dat")) !=
+        if (read_file(out / "src" / ("f" + std::to_string(i) + ".dat")) !=
             std::string(100000, static_cast<char>('a' + i % 26)))
             all_ok = false;
     CHECK(all_ok);
@@ -228,4 +228,68 @@ TEST_CASE("cli: options are accepted before or after the command", "[cli]") {
     auto r = run(cli("list '" + arc.string() + "'"));
     CHECK(r.code == 0);
     CHECK(contains(r.out, "p.txt"));
+}
+
+TEST_CASE("cli: tar-style top dir + -C + contents-only + multi-root", "[cli]") {
+    temp_dir td;
+    write_file(td.path / "proj/a.txt", "alpha");
+    write_file(td.path / "proj/sub/b.txt", "beta");
+
+    SECTION("directory arg stores the top dir (and trailing slash is a no-op)") {
+        const auto arc = td.path / "t1.arc";
+        REQUIRE(run(cli("create -q '" + arc.string() + "' '" + (td.path / "proj").string() + "'")).code == 0);
+        auto r = run(cli("list '" + arc.string() + "'"));
+        CHECK(contains(r.out, " proj\n")); // the top dir itself is an entry
+        CHECK(contains(r.out, "proj/a.txt"));
+        CHECK(contains(r.out, "proj/sub/b.txt"));
+        const auto out = td.path / "out";
+        REQUIRE(run(cli("extract -q '" + arc.string() + "' '" + out.string() + "'")).code == 0);
+        CHECK(read_file(out / "proj/a.txt") == "alpha");
+        CHECK(read_file(out / "proj/sub/b.txt") == "beta");
+
+        // "proj/" must produce the same entry names as "proj"
+        const auto arc2 = td.path / "t2.arc";
+        REQUIRE(run(cli("create -q '" + arc2.string() + "' '" + (td.path / "proj").string() + "/'")).code == 0);
+        CHECK(run(cli("list '" + arc2.string() + "'")).out == r.out);
+    }
+
+    SECTION("-C resolves archive and inputs from DIR (like tar -C)") {
+        auto r = run(cli("-C '" + td.path.string() + "' create -q rel.arc proj"));
+        REQUIRE(r.code == 0);
+        CHECK(std::filesystem::exists(td.path / "rel.arc"));
+        r = run(cli("list '" + (td.path / "rel.arc").string() + "'"));
+        CHECK(contains(r.out, "proj/a.txt"));
+        // missing -C dir → rc 1 with a message
+        r = run(cli("-C /definitely/missing create -q x.arc ."));
+        CHECK(r.code == 1);
+        CHECK(contains(r.err, "current path"));
+    }
+
+    SECTION("-C DIR . stores only the contents") {
+        const auto arc = td.path / "t3.arc";
+        REQUIRE(run(cli("create -q '" + arc.string() + "' -C '" +
+                        (td.path / "proj").string() + "' .")).code == 0);
+        auto r = run(cli("list '" + arc.string() + "'"));
+        CHECK(contains(r.out, "a.txt"));
+        CHECK_FALSE(contains(r.out, "proj/a.txt"));
+        const auto out = td.path / "out";
+        REQUIRE(run(cli("extract -q '" + arc.string() + "' '" + out.string() + "'")).code == 0);
+        CHECK(read_file(out / "a.txt") == "alpha");
+        CHECK(read_file(out / "sub/b.txt") == "beta");
+    }
+
+    SECTION("two directory args no longer collide at the root") {
+        write_file(td.path / "d1/conf", "one");
+        write_file(td.path / "d2/conf", "two");
+        const auto arc = td.path / "t4.arc";
+        REQUIRE(run(cli("create -q '" + arc.string() + "' '" + (td.path / "d1").string() +
+                        "' '" + (td.path / "d2").string() + "'")).code == 0);
+        auto r = run(cli("list '" + arc.string() + "'"));
+        CHECK(contains(r.out, "d1/conf"));
+        CHECK(contains(r.out, "d2/conf"));
+        const auto out = td.path / "out";
+        REQUIRE(run(cli("extract -q '" + arc.string() + "' '" + out.string() + "'")).code == 0);
+        CHECK(read_file(out / "d1/conf") == "one");
+        CHECK(read_file(out / "d2/conf") == "two");
+    }
 }

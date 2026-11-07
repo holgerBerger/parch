@@ -10,7 +10,7 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-- **Builds green (2026-11, Phases 0–5, 7–10 done):** 95/95 tests default; 101/101 with `-DARCH_WITH_URING=ON`. The policy flag is set inside CMakeLists (`CMAKE_POLICY_VERSION_MINIMUM`), not required on the command line anymore.
+- **Builds green (2026-11, Phases 0–5, 7–10 done):** 97/97 tests default; 103/103 with `-DARCH_WITH_URING=ON`. The policy flag is set inside CMakeLists (`CMAKE_POLICY_VERSION_MINIMUM`), not required on the command line anymore.
 - CMake 3.22+, C++20 compiler. Note: GCC 15 rejects `opts = {}` default arguments for nested classes with only implicit ctors — `writer::options` has an explicit `options() {}` for this; don't remove it. Default build is plain POSIX — **liburing is NOT required**.
 - io_uring backend is opt-in: `-DARCH_WITH_URING=ON` (needs `liburing-devel`/`liburing-dev` via pkg-config) and pulls in `src/io/io_uring_pool.cpp`, `src/io/prefetch.cpp` + their tests.
 - **libacl is a required system dep** (`pkg_check_modules(LIBACL REQUIRED ...)`) for the ACL capture/restore in `src/util/xattr.cpp` (Phase 7). All other deps (spdlog, zstd, crc32c, xxHash) are fetched via FetchContent — no manual install needed.
@@ -40,7 +40,8 @@ docs/                — format spec, test plan, API reference, benchmarks.md (P
 
 `src/main.cpp` is the `arch` CLI (Phase 5): `create` / `append` / `list` /
 `extract`; options map 1:1 to `writer::options` / `reader::options`
-(`-c zstd|none`, `-l`, `-j`, `--depth`, `--dedup`, `--no-sync`, `-v`/`-q`).
+(`-c zstd|none`, `-l`, `-j`, `--depth`, `--dedup`, `--no-sync`, `-C DIR`,
+`-v`/`-q`).
 The `arch` target links `archiver_lib` inside a literal
 `-Wl,--whole-archive ... -Wl,--no-whole-archive` pair in CMakeLists — required
 for the `REGISTER_COMPRESSOR` static init (see linking note below).
@@ -65,7 +66,7 @@ for the `REGISTER_COMPRESSOR` static init (see linking note below).
 - **XXH3-128 dedup identity** — `content_id` is 16 bytes (block_entry 48 B); 64-bit was rejected as silently corrupting on collision.
 - **TOC CRC covers metadata only** (header + entries + strings) so `list()` never reads data blocks.
 - **Durable append**: data → fsync → TOC → fsync → TOC table + footer → fsync; references past EOF = clean truncation point.
-- **Relative paths only** in the string table (rooted at the `add_tree()` argument); extraction rejects absolute / `..`-escaping names.
+- **Relative paths only** in the string table (rooted at the `add_tree()` argument, or at the optional `store_prefix` tar-style root name); extraction rejects absolute / `..`-escaping names.
 - **Symlink targets and hardlinks are first-class** — `file_entry` gains `symlink_target_id` and `link_target_id` (Phase 1 item 11).
 - **io_uring is optional**; the default I/O path is portable POSIX threads + `pread`.
 
@@ -129,7 +130,7 @@ for the `REGISTER_COMPRESSOR` static init (see linking note below).
   - **Wave-3 single-`extract()` path**: extracting a hardlink dup via `reader::extract()` (not `extract_all`) resolves the owner through `by_path` and extracts the owner's blocks under the dup's name (no `link()` — matches old fallback semantics).
 
 ### CLI (`src/main.cpp`)
-- Diagnostics/progress → stderr (spdlog stderr sink), `list` rows → stdout (pipeable). `verify` failing-entry lines also go to **stdout** (one per line, pipeable). Options parse before *or* after the command word. Directory args → `add_tree`, file args → `add_file` (basename storage — same-name files collide, like tar without dirs). Options include `--no-sparse` (clears `writer::options.sparse`; archive stays v0.2). Exit codes: 0 / 1 (runtime or verify failure) / 2 (usage). `test/test_cli.cpp` shells the binary out via `ARCH_CLI_BINARY="$<TARGET_FILE:arch>"` — keep that define in test/CMakeLists.
+- Diagnostics/progress → stderr (spdlog stderr sink), `list` rows → stdout (pipeable). `verify` failing-entry lines also go to **stdout** (one per line, pipeable). Options parse before *or* after the command word. `-C DIR` chdirs **before anything** (archive path included, like `tar -C DIR -cf …`). Directory args go through `add_tree` **tar-style** — the CLI passes the arg's final path component as `store_prefix`, so `create a.arc dir` stores `dir`, `dir/...` (trailing slash irrelevant; a final `.` component, e.g. `-C dir .`, opts back into contents-only storage); file args → `add_file` (basename storage — same-name files collide, like tar without dirs). Options include `--no-sparse` (clears `writer::options.sparse`; archive stays v0.2). Exit codes: 0 / 1 (runtime or verify failure) / 2 (usage). `test/test_cli.cpp` shells the binary out via `ARCH_CLI_BINARY="$<TARGET_FILE:arch>"` — keep that define in test/CMakeLists.
 
 ### `xattr.cpp` — ACL notes (Phase 7)
 - **ACL blob layout** (docs/format.md §ACL Storage): `access_text NUL [default_text NUL]` + the writer's trailing `NUL` terminator — slot position decides the type (libacl text carries no `default:` marker). `read_acl` stores nothing for mode-equivalent (trivial) access ACLs; when only a default ACL exists it stores a mode-derived base-3 placeholder so the default lands in slot 1. Blobs are self-terminating: callers slice `strings.substr(acl_id)` like xattr blobs.
@@ -163,4 +164,4 @@ for the `REGISTER_COMPRESSOR` static init (see linking note below).
 - Tests use `mkstemp` for temp files (not Catch2's file helpers).
 
 ## Phase Checklist (current status)
-See PLAN.md for full status. In short: **Phases 0–5, 7–10 ✅** (builds green; `format.h` on v0.3-minimal (v0.2 layouts + `COMPRESSOR_SPARSE`); writer streams + serializes spec-conformant archives with pipelined `add_tree`; reader parses/validates/extracts in a parallel wave pipeline with corruption + truncation-tolerance semantics; `writer::append()` static factory works and is covered by two-section roundtrip tests — 95/95 default, 101/101 `ARCH_WITH_URING=ON`; reader is ASan/UBSan-clean and TSan-clean, incl. Phase 10); CLI ✅ (`arch create/append/list/extract/verify`, subprocess-tested, ASan-clean via `[cli]` tests); ACL roundtrip ✅ (libacl, access + default ACLs archived and restored, `[acl]` tests); sparse files + retry + verify ✅ (Phase 8, `test/test_sparse.cpp` 14 cases, ASan/UBSan/TSan-clean); benchmarks + memory profile ✅ (Phase 9, `bench/` + `docs/benchmarks.md` — 28× pipeline create win under simulated netfs latency, extract beats tar everywhere, dedup RAM 36 GiB/PiB). **All v1 phases complete.** Optional **Phase 10** ✅ (2026-11: Option A of `docs/extract-pipeline.md` implemented — single-fd handoff + fd-based xattr/ACL + `reader::options{depth,threads}` two-knob pools + parallel `verify_all` + `--profile` timing report; extract under simulated netfs latency 13.9 → **210 MiB/s** at depth 32, docs/benchmarks.md §3.1; Option B still gated on real-NFS bandwidth data).
+See PLAN.md for full status. In short: **Phases 0–5, 7–10 ✅** (builds green; `format.h` on v0.3-minimal (v0.2 layouts + `COMPRESSOR_SPARSE`); writer streams + serializes spec-conformant archives with pipelined `add_tree`; reader parses/validates/extracts in a parallel wave pipeline with corruption + truncation-tolerance semantics; `writer::append()` static factory works and is covered by two-section roundtrip tests — 97/97 default, 103/103 `ARCH_WITH_URING=ON`; reader is ASan/UBSan-clean and TSan-clean, incl. Phase 10); CLI ✅ (`arch create/append/list/extract/verify`, subprocess-tested, ASan-clean via `[cli]` tests); ACL roundtrip ✅ (libacl, access + default ACLs archived and restored, `[acl]` tests); sparse files + retry + verify ✅ (Phase 8, `test/test_sparse.cpp` 14 cases, ASan/UBSan/TSan-clean); benchmarks + memory profile ✅ (Phase 9, `bench/` + `docs/benchmarks.md` — 28× pipeline create win under simulated netfs latency, extract beats tar everywhere, dedup RAM 36 GiB/PiB). **All v1 phases complete.** Optional **Phase 10** ✅ (2026-11: Option A of `docs/extract-pipeline.md` implemented — single-fd handoff + fd-based xattr/ACL + `reader::options{depth,threads}` two-knob pools + parallel `verify_all` + `--profile` timing report; extract under simulated netfs latency 13.9 → **210 MiB/s** at depth 32, docs/benchmarks.md §3.1; Option B still gated on real-NFS bandwidth data).

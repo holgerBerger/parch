@@ -111,7 +111,7 @@ Storage rules:
 Archives in-memory data. Path is stored verbatim as the entry name. Data is
 split into 4 MiB blocks, compressed, and CRC32C checksummed.
 
-### `void add_tree(root)`
+### `void add_tree(root, store_prefix = {})`
 
 Recursively archives the directory tree at `root`:
 - Entry names are stored **relative to `root`** (no leading `/`, no `..`).
@@ -121,6 +121,12 @@ Recursively archives the directory tree at `root`:
   read concurrently — this is why recursion is a first-class operation rather
   than a caller-side loop (a serial loop re-creates the per-file network
   round-trip cost the archiver exists to hide).
+- With a non-empty `store_prefix` (tar-style storage of the top level): the
+  root itself becomes a directory entry named `store_prefix` (stored first,
+  like tar lists `dir/`) and every descendant is stored under
+  `store_prefix/...`. The prefix must be a plain relative path without
+  `.`/`..` elements (`std::runtime_error` otherwise); a multi-component
+  prefix is fine — extraction creates missing intermediate directories.
 
 **Throws** `std::system_error` on any filesystem error.
 
@@ -552,7 +558,8 @@ opts.pipeline_depth   = 64;   // many-small-files over NFS: raise this
 opts.compression_level = 5;
 
 arch::writer w("backup.arc", opts);
-w.add_tree("/srv/data");                          // relative names under "data/"
+w.add_tree("/srv/data");                          // names relative to "data"
+w.add_tree("/srv/data", "data");                  // tar-style: "data/..." entries
 w.add_file("notes.txt", std::string_view("Hello, World!")); // in-memory entry
 w.finalize();
 ```
@@ -633,6 +640,9 @@ opts:
       --dedup             within-section content dedup (XXH3-128)
       --no-sync           skip fsync barriers (faster, less durable)
       --no-sparse         store holes as zero-filled blocks (archive stays v0.2)
+  -C, --directory DIR     chdir to DIR before anything: the archive path and all
+                          inputs resolve from there (like tar -C; e.g. store the
+                          contents of a dir without its name: -C DIR . )
   -v, --verbose           debug logging
   -q, --quiet             errors only
       --version           print version and exit
@@ -642,10 +652,17 @@ opts:
 - `create` / `append` map the options 1:1 onto `writer::options`
   (`append` uses the `writer::append()` static factory — one new TOC
   section per invocation); `--profile` sets `writer::options.profile` and
-  the create report is printed by `finalize()`. **Directory** arguments go through `add_tree`
-  (names stored relative to the directory); plain **file** arguments go
-  through `add_file` and are stored by their basename (same-basename files
-  from different directories collide, like `tar` without leading dirs).
+  the create report is printed by `finalize()`. **Directory** arguments are
+  stored tar-style via `add_tree(name, prefix)`: the directory's own final
+  path component becomes the entry prefix, including a top-level directory
+  entry (`arch create a.arc dir` stores `dir`, `dir/a.txt`, …; a trailing
+  slash makes no difference; `..` resolves to the parent's real name). A
+  final `.` component stores **only the contents** (the old behavior):
+  `arch create a.arc -C dir .`. Plain **file** arguments go through
+  `add_file` and are stored by their basename (same-basename files from
+  different directories collide, like `tar` without leading dirs). `-C`
+  chdirs before anything else, so the **archive path is resolved from it
+  too** (like `tar -C DIR -cf a.tar …`); a bad `-C` dir exits 1.
 - `list` reads metadata only (no data blocks) and prints one row per entry
   in `ls -l`-style: type+permissions, size, mtime, path, and ` -> target`
   for symlinks/hardlinks.
