@@ -22,6 +22,8 @@
 
 using namespace arch;
 
+namespace fs = std::filesystem;
+
 namespace {
 
 struct temp_dir {
@@ -652,4 +654,138 @@ TEST_CASE("reader: pipelined multi-file archive extracts fully", "[reader][pipel
     r.extract_all(out);
     for (auto& [name, bytes] : want)
         CHECK(read_file(out / name) == bytes);
+}
+
+// ---- Phase 10: two-knob pool + profiling (docs/extract-pipeline.md §6) ----
+
+TEST_CASE("reader extract: depth x threads matrix is byte-identical", "[reader][phase10]") {
+    temp_dir td;
+    auto t = make_tree(td.path);
+    auto arc = archive_in(td);
+    {
+        writer w(arc);
+        w.add_tree(t.root);
+        w.finalize();
+    }
+    for (int depth : {1, 5, 32}) {
+        for (int threads : {1, 4}) {
+            const auto out = td.path / ("out_d" + std::to_string(depth) +
+                                        "_t" + std::to_string(threads));
+            reader::options ro;
+            ro.depth = depth;
+            ro.threads = threads;
+            reader r(arc, ro);
+            REQUIRE_NOTHROW(r.extract_all(out));
+            for (auto& [rel, d] : t.contents)
+                CHECK(read_file(out / rel) == d);
+            // symlink + hardlink still materialised at every setting
+            CHECK(fs::is_symlink(out / "docs/link.md"));
+            CHECK(read_file(out / "docs/readme.hard") == t.contents["docs/readme.md"]);
+        }
+    }
+}
+
+TEST_CASE("reader profile report: contents and hints", "[reader][phase10][profile]") {
+    temp_dir td;
+    auto t = make_tree(td.path);
+    auto arc = archive_in(td);
+    {
+        writer w(arc);
+        w.add_tree(t.root);
+        w.finalize();
+    }
+    // Off (default): empty report, nothing changes functionally.
+    {
+        reader r(arc);
+        r.extract_all(td.path / "out0");
+        CHECK(r.profile_report().empty());
+    }
+    // On: summary + at least the read/crc/write stages appear.
+    reader::options ro;
+    ro.profile = true;
+    ro.depth = 2;
+    reader r(arc, ro);
+    const auto out = td.path / "outp";
+    r.extract_all(out);
+    for (auto& [rel, d] : t.contents)
+        CHECK(read_file(out / rel) == d);
+    const auto rep = r.profile_report();
+    CHECK_FALSE(rep.empty());
+    CHECK(rep.find("arch profile:") != std::string::npos);
+    CHECK(rep.find("worker utilization") != std::string::npos);
+    for (const char* stage : {"archive read", "crc32c", "decompress", "write out",
+                              "create+open", "metadata"})
+        CHECK(rep.find(stage) != std::string::npos);
+    CHECK(rep.find("files") != std::string::npos); // summary line counts files
+    // Counters are cumulative: verify on the same reader keeps growing them.
+    CHECK(r.verify_all().empty());
+    const auto rep2 = r.profile_report();
+    auto ops_of = [](const std::string& s, const char* stage) {
+        auto p = s.find(stage);
+        REQUIRE(p != std::string::npos);
+        auto q = s.find(" ops", p); // line reads "... (N ops, X us/op)"
+        REQUIRE(q != std::string::npos);
+        auto l = s.rfind('(', q);
+        return std::stoull(s.substr(l + 1, q - l - 1));
+    };
+    CHECK(ops_of(rep2, "archive read") > ops_of(rep, "archive read"));
+    // verify alone also reports (fresh reader, sink path exercises fd == -1)
+    reader::options vo;
+    vo.profile = true;
+    reader r2(arc, vo);
+    REQUIRE(r2.verify_all().empty());
+    CHECK_FALSE(r2.profile_report().empty());
+}
+
+TEST_CASE("reader fd-based xattr/ACL restore lands on the extracted file", "[reader][phase10][xattr]") {
+    temp_dir td;
+    auto t = make_tree(td.path);
+    auto arc = archive_in(td);
+    {
+        writer w(arc);
+        w.add_tree(t.root);
+        w.finalize();
+    }
+    const auto out = td.path / "out";
+    reader r(arc);
+    r.extract_all(out);
+    char buf[64] = {};
+    const ssize_t n = ::getxattr((out / "xattr.bin").c_str(), "user.arch.test",
+                                 buf, sizeof buf);
+    REQUIRE(n == 5);
+    CHECK(std::string(buf, n) == "hello");
+    // Mode survived too (fd-based fchmod path).
+    struct stat st{};
+    REQUIRE(::stat((out / "docs/readme.md").c_str(), &st) == 0);
+    struct stat src{};
+    REQUIRE(::stat((t.root / "docs/readme.md").c_str(), &src) == 0);
+    CHECK((st.st_mode & 07777) == (src.st_mode & 07777));
+}
+
+TEST_CASE("reader verify_all: parallel error parity with serial depth=1", "[reader][phase10][verify]") {
+    temp_dir td;
+    auto t = make_tree(td.path);
+    auto arc = archive_in(td);
+    {
+        writer w(arc);
+        w.add_tree(t.root);
+        w.finalize();
+    }
+    // Corrupt one data byte in the first block (data region starts right
+    // after the 128-byte TOC header at end-of-section-0 layout offset).
+    {
+        file_io f(arc);
+        f.flip(format::ARCHIVE_HEADER_SIZE + format::TOC_HEADER_SIZE + 10);
+    }
+    reader::options ro;
+    ro.depth = 1;
+    reader r1(arc, ro);
+    auto serial = r1.verify_all();
+    reader::options rp;
+    rp.depth = 16;
+    rp.threads = 4;
+    reader r2(arc, rp);
+    auto parallel = r2.verify_all();
+    CHECK(serial == parallel);           // same errors, same order
+    CHECK_FALSE(serial.empty());
 }

@@ -75,9 +75,10 @@ std::uint64_t read_xattrs(std::filesystem::path path, std::vector<std::uint8_t>&
 
 namespace {
 
-// One NUL-terminated ACL text (access or default) → acl_set_file.
+// One NUL-terminated ACL text (access or default) → acl_set_file, or
+// acl_set_fd when `fd >= 0` (type must be ACL_TYPE_ACCESS then; Phase 10).
 void apply_acl_text(const std::filesystem::path& path, std::string_view text,
-                    acl_type_t type) {
+                    acl_type_t type, int fd = -1) {
     const std::string z(text);
     acl_t a = ::acl_from_text(z.c_str());
     if (!a) {
@@ -104,14 +105,18 @@ void apply_acl_text(const std::filesystem::path& path, std::string_view text,
     if (!has_mask && has_named && ::acl_calc_mask(&a) != 0)
         SPDLOG_DEBUG("acl_calc_mask failed for {}: {}", path.c_str(), strerror(errno));
 
-    if (::acl_set_file(path.c_str(), type, a) != 0) {
+    const int rc = fd >= 0 ? ::acl_set_fd(fd, a)
+                           : ::acl_set_file(path.c_str(), type, a);
+    if (rc != 0) {
         // A filesystem without ACL support must not fail extraction; EPERM
         // happens restoring onto a file we do not own.
         if (errno == EOPNOTSUPP || errno == ENOTSUP || errno == ENOSYS || errno == EPERM)
-            SPDLOG_DEBUG("acl_set_file {} ({}) unsupported: {}", path.c_str(),
+            SPDLOG_DEBUG("acl_set_{} {} ({}) unsupported: {}", fd >= 0 ? "fd" : "file",
+                         path.c_str(),
                          type == ACL_TYPE_DEFAULT ? "default" : "access", strerror(errno));
         else
-            SPDLOG_WARN("acl_set_file {} failed: {}", path.c_str(), strerror(errno));
+            SPDLOG_WARN("acl_set_{} {} failed: {}", fd >= 0 ? "fd" : "file",
+                        path.c_str(), strerror(errno));
     }
     ::acl_free(a);
 }
@@ -183,10 +188,14 @@ std::uint64_t read_acl(std::filesystem::path path, std::vector<std::uint8_t>& ou
     return off;
 }
 
-void write_xattrs(std::filesystem::path path, std::string_view blob) {
+namespace {
+// Shared blob walk: [len u32, name_len u16, name, vlen u32, value] × N +
+// zero-length terminator (docs/format.md §Xattr Storage). `set` receives
+// (name, value, vlen).
+template <class Set>
+void each_xattr(std::string_view blob, Set&& set) {
     auto* p = reinterpret_cast<const std::uint8_t*>(blob.data());
     auto* end = p + blob.size();
-
     while (p + 4 <= end) {
         std::uint32_t total_be, total;
         std::memcpy(&total_be, p, 4);
@@ -203,10 +212,24 @@ void write_xattrs(std::filesystem::path path, std::string_view blob) {
         vlen = arch::format::betoh32_safe(vlen_be);
         auto* val = p + 6 + nlen + 4;
 
-        ::setxattr(path.c_str(), name.data(), val, vlen, 0);
-
+        set(name, val, vlen);
         p += total;
     }
+}
+} // namespace
+
+void write_xattrs(std::filesystem::path path, std::string_view blob) {
+    each_xattr(blob, [&](std::string_view name, const std::uint8_t* val,
+                         std::uint32_t vlen) {
+        ::setxattr(path.c_str(), name.data(), val, vlen, 0);
+    });
+}
+
+void write_xattrs(int fd, std::string_view blob) {
+    each_xattr(blob, [&](std::string_view name, const std::uint8_t* val,
+                         std::uint32_t vlen) {
+        ::fsetxattr(fd, name.data(), val, vlen, 0);
+    });
 }
 
 void write_acl(std::filesystem::path path, std::string_view blob) {
@@ -225,4 +248,20 @@ void write_acl(std::filesystem::path path, std::string_view blob) {
     }
 }
 
+void write_acl(int fd, std::string_view blob) {
+    // fd route = regular files (extraction waves): only the access ACL can
+    // live on an fd (acl_set_fd); a stray default slot is debug-logged.
+    const auto nul = blob.find('\0');
+    const std::string_view text =
+        nul == std::string_view::npos ? blob : blob.substr(0, nul);
+    if (!text.empty())
+        apply_acl_text({}, text, ACL_TYPE_ACCESS, fd);
+    if (nul != std::string_view::npos) {
+        const std::string_view rest = blob.substr(nul + 1);
+        const auto nul2 = rest.find('\0');
+        if (!rest.substr(0, nul2 == std::string_view::npos
+                               ? rest.size() : nul2).empty())
+            SPDLOG_DEBUG("fd-based ACL restore skipped default slot (not a directory)");
+    }
+}
 } // namespace arch::util

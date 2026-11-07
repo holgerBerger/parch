@@ -79,7 +79,11 @@ public:
     struct options {
         options() {}  // explicit default ctor (GCC 15 nested-class quirk,
                       // same reason as writer::options)
-        int threads = 0;   // extract_all worker pool size; 0 → hardware concurrency
+        int threads = 0;     // CRC+decompress concurrency (permits); 0 → hardware concurrency
+        int depth = 32;      // extract_all/verify_all workers: files in flight.
+                             // The latency knob (Phase 10, docs/extract-pipeline.md).
+        bool profile = false; // collect per-stage timings; report emitted on
+                              // stderr after extract_all/verify_all, see profile_report()
     };
 
     explicit reader(std::filesystem::path path, options opts = {});
@@ -114,6 +118,11 @@ public:
     /// error string per failing entry — empty vector means the data is
     /// intact. Metadata-level validity is guaranteed by the constructor.
     std::vector<std::string> verify_all() const;
+
+    /// With options.profile: a human-readable per-stage timing breakdown
+    /// with tuning hints (also printed to stderr at the end of
+    /// extract_all/verify_all). Empty string when profiling is off.
+    std::string profile_report() const;
 
     /// Get extended attributes for an entry.
     std::vector<std::pair<std::string, std::vector<std::uint8_t>>>

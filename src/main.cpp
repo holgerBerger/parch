@@ -42,6 +42,7 @@ struct cli_opts {
     bool durable = true;
     bool sparse = true;
     bool threads_given = false;   // reader default = hardware concurrency
+    bool profile = false;         // reader::options.profile (extract/verify)
     // ui
     spdlog::level::level_enum log_level = spdlog::level::info;
 };
@@ -59,7 +60,10 @@ struct cli_opts {
         "  -c, --compressor NAME   zstd (default) or none (store)\n"
         "  -l, --level N           compression level (default 3)\n"
         "  -j, --threads N         compression / extraction workers (default 4)\n"
-        "      --depth N           files in flight in the I/O pipeline (default 32)\n"
+        "      --depth N           files in flight: I/O pipeline (create) / extract+verify\n"
+        "                          workers (default 32)\n"
+        "      --profile           per-stage timing report + tuning hints on stderr\n"
+        "                          (extract, verify)\n"
         "      --dedup             within-section content dedup (XXH3-128)\n"
         "      --no-sync           skip fsync barriers (faster, less durable)\n"
         "      --no-sparse         store holes as zero-filled blocks (archive stays v0.2)\n"
@@ -97,6 +101,7 @@ std::vector<std::string> parse_args(int argc, char** argv, cli_opts& o) {
         else if (a == "-l" || a == "--level")  o.level = static_cast<int>(parse_u64(need_value(i, "-l"), "--level"));
         else if (a == "-j" || a == "--threads") { o.threads = static_cast<int>(parse_u64(need_value(i, "-j"), "--threads")); o.threads_given = true; }
         else if (a == "--depth") o.depth = static_cast<std::size_t>(parse_u64(need_value(i, "--depth"), "--depth"));
+        else if (a == "--profile") o.profile = true;
         else if (a == "--dedup") o.dedup = true;
         else if (a == "--no-sync") o.durable = false;
         else if (a == "--no-sparse") o.sparse = false;
@@ -274,6 +279,8 @@ int cmd_extract(std::vector<std::string> args, const cli_opts& o) {
 
     arch::reader::options ro;
     if (o.threads_given) ro.threads = o.threads;
+    ro.depth = static_cast<int>(o.depth);
+    ro.profile = o.profile;
     arch::reader r(arc, ro);
 
     std::size_t n = r.list().size();
@@ -284,9 +291,13 @@ int cmd_extract(std::vector<std::string> args, const cli_opts& o) {
     return 0;
 }
 
-int cmd_verify(std::vector<std::string> args, const cli_opts& /*o*/) {
+int cmd_verify(std::vector<std::string> args, const cli_opts& o) {
     if (args.size() != 1) usage_error("usage: arch verify <archive>");
-    arch::reader r(args.front());          // constructor = metadata validation
+    arch::reader::options ro;
+    if (o.threads_given) ro.threads = o.threads;
+    ro.depth = static_cast<int>(o.depth);
+    ro.profile = o.profile;
+    arch::reader r(args.front(), ro);      // constructor = metadata validation
     const auto errors = r.verify_all();    // reads + CRCs every data block
     for (const auto& e : errors)
         std::printf("%s\n", e.c_str());    // failing entries on stdout, one/line

@@ -16,9 +16,14 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdio>
 #include <cstring>
+#include <ctime>
+#include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
+#include <semaphore>
 #include <stdexcept>
 #include <system_error>
 #include <thread>
@@ -32,6 +37,55 @@ namespace fs = std::filesystem;
 namespace {
 
 constexpr std::uint16_t FORMAT_VERSION = format::FORMAT_VERSION_SPARSE; // accepts <= v0.3
+
+// CRC+decompress concurrency gate (docs/extract-pipeline.md §3.2): file-pool
+// workers must hold one permit while doing CRC + decompression (CPU-bound,
+// options.threads wide) so latency-concurrency (options.depth workers) and
+// CPU-concurrency stay independently tunable.
+class decode_gate {
+public:
+    explicit decode_gate(int permits)
+        : sem_(permits < 1 ? 1 : permits), permits_(permits < 1 ? 1 : permits) {}
+    void acquire() { sem_.acquire(); }
+    void release() { sem_.release(); }
+    int permits() const { return permits_; }
+private:
+    std::counting_semaphore<> sem_;
+    int permits_;
+};
+
+// Runs fn(i) for i in [0, njobs) on nworkers threads. On the first throw,
+// records it, stops dispatching, joins, and returns it (callers rethrow).
+template <class Fn>
+std::exception_ptr run_jobs(std::size_t njobs, std::size_t nworkers, Fn&& fn)
+{
+    if (njobs == 0) return {};
+    const auto nw = std::max<std::size_t>(1, std::min(nworkers, njobs));
+    std::atomic<std::size_t> next{0};
+    std::atomic<bool> stop{false};
+    std::mutex m;
+    std::exception_ptr err;
+    std::vector<std::thread> pool;
+    pool.reserve(nw);
+    for (std::size_t w = 0; w < nw; ++w)
+        pool.emplace_back([&] {
+            for (;;) {
+                if (stop.load(std::memory_order_acquire)) return;
+                const std::size_t i = next.fetch_add(1);
+                if (i >= njobs) return;
+                try {
+                    fn(i);
+                } catch (...) {
+                    std::lock_guard<std::mutex> lk(m);
+                    if (!err) err = std::current_exception();
+                    stop.store(true, std::memory_order_release);
+                    return;
+                }
+            }
+        });
+    for (auto& t : pool) t.join();
+    return err;
+}
 
 std::string_view zstr(std::string_view table, std::uint64_t off, const char* what) {
     if (off == 0) return {}; // reserved NUL sentinel = "absent"
@@ -68,6 +122,42 @@ struct reader::impl {
     format::footer footer{};
     std::vector<section> sections;
     std::map<std::string, entry_location> by_path; // last section wins (append)
+
+    // ---- Phase 10 (docs/extract-pipeline.md §3): instrumentation ----
+    // Optional per-stage timers, enabled by options.profile. Off cost: one
+    // bool test per stage (clock_gettime only when on). Counters are
+    // cumulative across operations on this reader (extract_all, verify_all).
+    struct stage_timer {
+        std::atomic<std::uint64_t> ns{0};
+        std::atomic<std::uint64_t> ops{0};
+        void add(std::uint64_t dt) { ns.fetch_add(dt, std::memory_order_relaxed);
+                                     ops.fetch_add(1, std::memory_order_relaxed); }
+        void reset() { ns.store(0); ops.store(0); }
+    };
+    enum stage { STG_OPEN, STG_PREAD, STG_CRC, STG_DECODE, STG_PWRITE,
+                 STG_META, STG_PERMIT_WAIT, STG_COUNT };
+    static const char* stage_name(int s);
+    mutable stage_timer stages[STG_COUNT];
+    mutable std::atomic<std::uint64_t> wall_ns{0}, bytes_out{0}, files_done{0};
+
+    // CRC+decompress permit pool = options.threads (CPU knob); the file
+    // pool (options.depth) is the latency knob. Built by start_pool().
+    std::unique_ptr<class decode_gate> gate;
+
+    static std::uint64_t now_ns() {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        return static_cast<std::uint64_t>(ts.tv_sec) * 1000000000ull + ts.tv_nsec;
+    }
+    // RAII span: records elapsed ns when destroyed (if profiling on).
+    class span {
+        const impl* d_; int st_; std::uint64_t t0_;
+    public:
+        span(const impl* d, int st) : d_(d), st_(st),
+            t0_(d->opts.profile ? impl::now_ns() : 0) {}
+        ~span() { if (d_->opts.profile) d_->stages[st_].add(impl::now_ns() - t0_); }
+        span(const span&) = delete; span& operator=(const span&) = delete;
+    };
 
     ~impl() { if (fd >= 0) ::close(fd); }
 
@@ -110,9 +200,11 @@ struct reader::impl {
     };
 
     void extract_data(const entry_location& loc, std::int64_t block_first,
-                      std::int64_t block_count, const std::filesystem::path& dest,
+                      std::int64_t block_count, int out_fd,
+                      const std::filesystem::path& dest,
                       codec_cache& codecs, bool sink = false) const;
     std::vector<std::string> verify_all() const;
+    std::string profile_report() const;
     void restore_metadata(const format::file_entry& e,
                           const std::filesystem::path& dest, int fd_at_meta) const;
     const entry_location& find_entry(const std::string& path) const {
@@ -268,77 +360,102 @@ void reader::impl::parse_sections(const std::vector<format::toc_section_ref>& re
 }
 
 // ---- extraction ----
+// Phase 10 (docs/extract-pipeline.md §3.2): `out_fd` is the caller-owned
+// output descriptor (already opened O_WRONLY|O_CREAT|O_TRUNC) — extraction
+// never re-opens a file it just wrote (removes one create-path RT per file).
+// sink == true (verify): no fd, no pwrite; holes are not recreated.
 void reader::impl::extract_data(const entry_location& loc, std::int64_t block_first,
-                                std::int64_t block_count,
+                                std::int64_t block_count, int out_fd,
                                 const std::filesystem::path& dest,
                                 codec_cache& codecs, bool sink) const
 {
     const auto& sec = sections[loc.section];
     const auto& e = sec.entries[loc.index];
 
-    // sink mode (verify): bytes go to /dev/null, holes are not recreated.
-    int out = sink ? ::open("/dev/null", O_WRONLY)
-                   : ::open(dest.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (out < 0)
-        throw std::system_error(errno, std::generic_category(),
-                                "cannot create " + dest.string());
+    std::uint32_t file_crc = 0;
+    std::uint64_t woff = 0;
+    bool had_sparse = false;
+    for (std::int64_t j = 0; j < block_count; ++j) {
+        const auto& be = sec.blocks[static_cast<std::size_t>(block_first + j)];
 
-    try {
-        std::uint32_t file_crc = 0;
-        std::uint64_t woff = 0;
-        bool had_sparse = false;
-        for (std::int64_t j = 0; j < block_count; ++j) {
-            const auto& be = sec.blocks[static_cast<std::size_t>(block_first + j)];
-
-            // v0.3 sparse (hole) block: zero stored bytes, expands to
-            // uncompressed_size zeros. Never read; leave the output hole.
-            if (be.compressor_id == format::COMPRESSOR_SPARSE) {
-                if (footer.version < format::FORMAT_VERSION_SPARSE)
-                    throw std::runtime_error("sparse block in v" +
-                        std::to_string(footer.version) + " archive: " + dest.string());
-                if (be.compressed_size != 0 ||
-                    be.uncompressed_size > format::ARCH_BLOCK_SIZE)
-                    throw std::runtime_error("bogus sparse block entry in " +
-                                             dest.string() + " (block " +
-                                             std::to_string(j) + ")");
+        // v0.3 sparse (hole) block: zero stored bytes, expands to
+        // uncompressed_size zeros. Never read; leave the output hole.
+        if (be.compressor_id == format::COMPRESSOR_SPARSE) {
+            if (footer.version < format::FORMAT_VERSION_SPARSE)
+                throw std::runtime_error("sparse block in v" +
+                    std::to_string(footer.version) + " archive: " + dest.string());
+            if (be.compressed_size != 0 ||
+                be.uncompressed_size > format::ARCH_BLOCK_SIZE)
+                throw std::runtime_error("bogus sparse block entry in " +
+                                         dest.string() + " (block " +
+                                         std::to_string(j) + ")");
+            {
+                span s(this, STG_CRC);
                 if (crc32c::Extend(0, nullptr, 0) != be.crc32c)
                     throw std::runtime_error("sparse block CRC mismatch in " +
                                              dest.string() + " (block " +
                                              std::to_string(j) + ")");
-                file_crc = io::sparse::crc_extend_zeros(file_crc, be.uncompressed_size);
-                woff += be.uncompressed_size;
-                had_sparse = true;
-                continue;
             }
-            if (be.compressed_size == 0 || be.uncompressed_size > format::ARCH_BLOCK_SIZE)
-                throw std::runtime_error("bogus block entry in " + dest.string() +
-                                         " (block " + std::to_string(j) + ")");
-            // block offsets are section-relative; data region is
-            // [data_offset, data_offset + data_size).
-            if (be.offset < sec.hdr.data_offset ||
-                be.offset + be.compressed_size > sec.hdr.data_offset + sec.hdr.data_size)
-                throw std::runtime_error("block past section data region in " +
-                                         dest.string() + " (block " + std::to_string(j) + ")");
-            auto raw_stored = read_at(sec.start + be.offset, be.compressed_size);
-            if (crc32c::Crc32c(raw_stored.data(), raw_stored.size()) != be.crc32c)
-                throw std::runtime_error("block CRC mismatch in " + dest.string() +
-                                         " (block " + std::to_string(j) + ")");
+            file_crc = io::sparse::crc_extend_zeros(file_crc, be.uncompressed_size);
+            woff += be.uncompressed_size;
+            had_sparse = true;
+            continue;
+        }
+        if (be.compressed_size == 0 || be.uncompressed_size > format::ARCH_BLOCK_SIZE)
+            throw std::runtime_error("bogus block entry in " + dest.string() +
+                                     " (block " + std::to_string(j) + ")");
+        // block offsets are section-relative; data region is
+        // [data_offset, data_offset + data_size).
+        if (be.offset < sec.hdr.data_offset ||
+            be.offset + be.compressed_size > sec.hdr.data_offset + sec.hdr.data_size)
+            throw std::runtime_error("block past section data region in " +
+                                     dest.string() + " (block " +
+                                     std::to_string(j) + ")");
+        std::vector<std::uint8_t> raw_stored;
+        {
+            // Archive read stays OUTSIDE the decode permit: source-I/O
+            // concurrency scales with depth (file pool), CPU with threads.
+            span s(this, STG_PREAD);
+            raw_stored = read_at(sec.start + be.offset, be.compressed_size);
+        }
 
-            std::vector<std::uint8_t> plain;
-            if (be.compressor_id == format::COMPRESSOR_NONE) {
-                plain = std::move(raw_stored);
-                if (plain.size() != be.uncompressed_size)
-                    throw std::runtime_error("block size mismatch in " + dest.string());
-            } else {
-                plain = codecs.get(be.compressor_id)
-                            .decompress(raw_stored, be.uncompressed_size);
-                if (plain.size() != be.uncompressed_size)
-                    throw std::runtime_error("decompression failed for " + dest.string());
+        std::vector<std::uint8_t> plain;
+        {
+            std::uint64_t t0 = opts.profile ? now_ns() : 0;
+            gate->acquire();
+            if (opts.profile)
+                stages[STG_PERMIT_WAIT].add(now_ns() - t0);
+            try {
+                {
+                    span s(this, STG_CRC);
+                    if (crc32c::Crc32c(raw_stored.data(), raw_stored.size()) != be.crc32c)
+                        throw std::runtime_error("block CRC mismatch in " +
+                                                 dest.string() + " (block " +
+                                                 std::to_string(j) + ")");
+                }
+                if (be.compressor_id == format::COMPRESSOR_NONE) {
+                    plain = std::move(raw_stored);
+                    if (plain.size() != be.uncompressed_size)
+                        throw std::runtime_error("block size mismatch in " + dest.string());
+                } else {
+                    span s(this, STG_DECODE);
+                    plain = codecs.get(be.compressor_id)
+                                .decompress(raw_stored, be.uncompressed_size);
+                    if (plain.size() != be.uncompressed_size)
+                        throw std::runtime_error("decompression failed for " + dest.string());
+                }
+            } catch (...) {
+                gate->release();
+                throw;
             }
+            gate->release();
+        }
 
+        if (!sink) {
+            span s(this, STG_PWRITE);
             std::size_t done = 0;
             while (done < plain.size()) {
-                ssize_t w = ::pwrite(out, plain.data() + done, plain.size() - done,
+                ssize_t w = ::pwrite(out_fd, plain.data() + done, plain.size() - done,
                                      static_cast<off_t>(woff + done));
                 if (w < 0) {
                     if (errno == EINTR) continue;
@@ -348,28 +465,28 @@ void reader::impl::extract_data(const entry_location& loc, std::int64_t block_fi
                 }
                 done += static_cast<std::size_t>(w);
             }
-            file_crc = crc32c::Extend(file_crc, plain.data(), plain.size());
-            woff += plain.size();
         }
+        file_crc = crc32c::Extend(file_crc, plain.data(), plain.size());
+        woff += plain.size();
+    }
 
-        if (file_crc != e.checksum)
-            throw std::runtime_error("file checksum mismatch for " + dest.string() +
-                                     " (corrupt archive?)");
+    if (file_crc != e.checksum)
+        throw std::runtime_error("file checksum mismatch for " + dest.string() +
+                                 " (corrupt archive?)");
+    if (!sink) {
         // A trailing hole was never pwritten — extend the file so the last
         // block's zeros actually exist (interior holes already do: pwrite
         // past a hole leaves it unallocated).
-        if (had_sparse && !sink &&
-            ::ftruncate(out, static_cast<off_t>(woff)) != 0)
+        if (had_sparse &&
+            ::ftruncate(out_fd, static_cast<off_t>(woff)) != 0)
             throw std::system_error(errno, std::generic_category(),
                                     "ftruncate failed for " + dest.string());
         if (woff != e.uncompressed_size && e.uncompressed_size != 0)
             SPDLOG_WARN("extracted size {} != recorded {} for {}", woff,
                         e.uncompressed_size, dest.c_str());
-    } catch (...) {
-        ::close(out);
-        throw;
     }
-    ::close(out);
+    bytes_out.fetch_add(woff, std::memory_order_relaxed);
+    files_done.fetch_add(1, std::memory_order_relaxed);
 }
 
 // Restore mode/ownership/times onto an extracted path.
@@ -414,6 +531,7 @@ void reader::impl::extract_one(const entry_location& loc,
     std::error_code ec;
 
     if (S_ISLNK(e.mode)) {
+        span s(this, STG_OPEN); // symlink(2) + remove are create-path RTs
         const auto target = zstr(strings(loc.section), e.symlink_target_id, "symlink target");
         fs::create_directories(dest.parent_path(), ec);
         fs::remove(dest, ec); // idempotent re-extract
@@ -424,58 +542,71 @@ void reader::impl::extract_one(const entry_location& loc,
     }
 
     if (S_ISDIR(e.mode)) {
+        span s(this, STG_OPEN);
         fs::create_directories(dest, ec);
         if (ec) throw std::system_error(ec, "mkdir " + dest.string());
         return; // metadata applied in the final wave
     }
 
     if (S_ISREG(e.mode) || S_ISFIFO(e.mode)) {
+        // Phase 10 §3.2: ONE descriptor for data + metadata — the old code
+        // wrote the file in extract_data, closed it, then re-opened it just
+        // to fchmod/futimens, paying a second create-path RT per file.
         int out = -1;
+        struct fd_guard {
+            int& f;
+            ~fd_guard() { if (f >= 0) ::close(f); }
+        } guard{out};
+
         if (S_ISREG(e.mode)) {
-            fs::create_directories(dest.parent_path(), ec);
-            if (ec) throw std::system_error(ec, "mkdir " + dest.parent_path().string());
-            // Hardlink duplicate: no own block list — resolve the canonical
-            // owner entry (spec §File Entry) and store its data here.
             std::int64_t first = static_cast<std::int64_t>(e.block_list_offset);
             std::int64_t count = static_cast<std::int64_t>(e.block_count);
+            entry_location data_loc = loc;
+            // Hardlink duplicate: no own block list — resolve the canonical
+            // owner entry (spec §File Entry) and store its data here.
             if (e.link_target_id != 0) {
                 const auto owner_name =
                     std::string(zstr(strings(loc.section), e.link_target_id, "hardlink target"));
-                const auto& oloc = find_entry(owner_name);
-                first = static_cast<std::int64_t>(sections[oloc.section].entries[oloc.index].block_list_offset);
-                count = static_cast<std::int64_t>(sections[oloc.section].entries[oloc.index].block_count);
-                extract_data(oloc, first, count, dest, codecs);
-            } else {
-                extract_data(loc, first, count, dest, codecs);
+                data_loc = find_entry(owner_name);
+                const auto& oe = sections[data_loc.section].entries[data_loc.index];
+                first = static_cast<std::int64_t>(oe.block_list_offset);
+                count = static_cast<std::int64_t>(oe.block_count);
             }
-            out = ::open(dest.c_str(), O_WRONLY | O_NOFOLLOW);
-            if (out < 0)
-                throw std::system_error(errno, std::generic_category(), "reopen " + dest.string());
+            {
+                span s(this, STG_OPEN);
+                fs::create_directories(dest.parent_path(), ec);
+                if (ec) throw std::system_error(ec, "mkdir " + dest.parent_path().string());
+                out = ::open(dest.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                if (out < 0)
+                    throw std::system_error(errno, std::generic_category(),
+                                            "cannot create " + dest.string());
+            }
+            // file_crc/size checks inside use data_loc's entry (owner's for
+            // dups — identical content, matching the pre-Phase-10 behavior).
+            extract_data(data_loc, first, count, out, dest, codecs);
         } else { // FIFO
+            span s(this, STG_OPEN);
             if (::mkfifo(dest.c_str(), (e.mode & 07777) | S_IFIFO) != 0 && errno != EEXIST)
                 throw std::system_error(errno, std::generic_category(), "mkfifo " + dest.string());
         }
 
-        restore_metadata(e, dest, out);
-
-        // Xattr / ACL blobs (path-based; regular files only).
-        if (S_ISREG(e.mode) && out >= 0) {
-            if (e.xattr_id) {
-                auto sv = strings(loc.section);
-                util::write_xattrs(dest, sv.substr(e.xattr_id));
-            }
-            if (e.acl_id) {
-                auto sv = strings(loc.section);
-                // ACL blob is self-terminating (empty string closes it).
-                util::write_acl(dest, sv.substr(e.acl_id));
+        {
+            span s(this, STG_META);
+            restore_metadata(e, dest, out);
+            // Xattr / ACL blobs (fd-based since Phase 10; regular files only).
+            if (S_ISREG(e.mode) && out >= 0) {
+                if (e.xattr_id)
+                    util::write_xattrs(out, strings(loc.section).substr(e.xattr_id));
+                if (e.acl_id) // access-only on fd (no default ACLs on files)
+                    util::write_acl(out, strings(loc.section).substr(e.acl_id));
             }
         }
-        if (out >= 0) ::close(out);
-        return;
+        return; // guard closes `out`
     }
 
     // Block/char devices: best effort (needs privileges); sockets skipped.
     if (S_ISBLK(e.mode) || S_ISCHR(e.mode)) {
+        span s(this, STG_OPEN);
         fs::create_directories(dest.parent_path(), ec);
         if (::mknod(dest.c_str(), e.mode,
                     makedev(e.rdev_major, e.rdev_minor)) != 0)
@@ -489,15 +620,128 @@ void reader::impl::extract_one(const entry_location& loc,
 
 // ---- public API ----
 
+const char* reader::impl::stage_name(int st) {
+    switch (st) {
+        case STG_OPEN:        return "create+open ";
+        case STG_PREAD:       return "archive read";
+        case STG_CRC:         return "crc32c      ";
+        case STG_DECODE:      return "decompress  ";
+        case STG_PWRITE:      return "write out   ";
+        case STG_META:        return "metadata    ";
+        case STG_PERMIT_WAIT: return "permit wait";
+        default:              return "?";
+    }
+}
+
 reader::reader(std::filesystem::path path, options opts)
     : d(std::make_unique<impl>())
 {
     d->arc_path = std::move(path);
     d->opts = opts;
+    int permits = opts.threads > 0
+                      ? opts.threads
+                      : static_cast<int>(std::thread::hardware_concurrency());
+    if (permits < 1) permits = 1;
+    d->gate = std::make_unique<decode_gate>(permits);
     d->open_and_parse();
 }
 
 reader::~reader() = default;
+
+std::string reader::profile_report() const { return d->profile_report(); }
+
+// Human-readable per-stage breakdown + tuning hints (options.profile).
+// "busy" = summed worker time across stages; wall vs busy* shows how much
+// of the run was latency stalls rather than work — that pairing drives
+// the depth/threads hints (docs/extract-pipeline.md §3, §7).
+std::string reader::impl::profile_report() const
+{
+    if (!opts.profile) return {};
+    std::string out;
+    char line[256];
+    std::uint64_t busy = 0;
+    for (int i = 0; i < STG_COUNT; ++i) busy += stages[i].ns.load();
+    const double wall = wall_ns.load() / 1e9;
+    const double bytes = bytes_out.load();
+    // Worker utilization: summed stage ns vs (wall ns × depth workers).
+    const double util = wall_ns.load() > 0
+        ? static_cast<double>(busy) /
+              (static_cast<double>(wall_ns.load()) * std::max(1, opts.depth))
+        : 0.0;
+    std::snprintf(line, sizeof line,
+                  "arch profile: %llu files, %.1f MiB written, %.3f s wall, "
+                  "workers=%d permits=%d, busy=%.2f s (%.1f%% worker utilization)\n",
+                  (unsigned long long)files_done.load(), bytes / (1 << 20), wall,
+                  std::max(1, opts.depth), gate->permits(), busy / 1e9,
+                  100.0 * util);
+    out += line;
+    for (int i = 0; i < STG_COUNT; ++i) {
+        const auto ns = stages[i].ns.load();
+        const auto ops = stages[i].ops.load();
+        if (!ns && !ops) continue;
+        std::snprintf(line, sizeof line,
+                      "  %s %8.3f s %5.1f%% of busy  (%llu ops, %.1f us/op)\n",
+                      stage_name(i), ns / 1e9, busy ? 100.0 * ns / busy : 0.0,
+                      (unsigned long long)ops, ops ? ns / 1000.0 / ops : 0.0);
+        out += line;
+    }
+    auto frac = [&](int st) { return busy ? static_cast<double>(stages[st].ns.load()) / busy : 0.0; };
+    const double rt = frac(STG_OPEN) + frac(STG_META);
+    const double cpu = frac(STG_CRC) + frac(STG_DECODE);
+    std::uint64_t hints = 0;
+    if (busy == 0 || wall == 0) return out;
+    if (rt > 0.30) {
+        std::snprintf(line, sizeof line,
+                      "arch profile hint: output-side RTs (create+open+metadata) are %.0f%% "
+                      "of worker time — latency-bound: raise --depth (currently %d)%s\n",
+                      rt * 100.0, std::max(1, opts.depth),
+                      opts.depth >= 128 ? " (already deep: the target FS's metadata "
+                                        "rate is the floor; consider skipping metadata restore)"
+                                        : "");
+        out += line; ++hints;
+    }
+    if (frac(STG_PERMIT_WAIT) > 0.15) {
+        std::snprintf(line, sizeof line,
+                      "arch profile hint: workers wait %.0f%% of busy time on decode permits "
+                      "— -j %d is the bottleneck: raise -j, or lower the compression level "
+                      "to cut per-block CPU\n",
+                      frac(STG_PERMIT_WAIT) * 100.0, gate->permits());
+        out += line; ++hints;
+    }
+    if (cpu > 0.50) {
+        std::snprintf(line, sizeof line,
+                      "arch profile hint: CRC+decompress is %.0f%% of busy time — CPU-bound: "
+                      "more -j (up to core count), or trade ratio for speed with a lower -l\n",
+                      cpu * 100.0);
+        out += line; ++hints;
+    }
+    if (frac(STG_PREAD) > 0.50) {
+        std::snprintf(line, sizeof line,
+                      "arch profile hint: archive reads are %.0f%% of busy time — source "
+                      "bandwidth/latency-bound; one huge file = one cursor (block fan-out "
+                      "needs the staged pipeline, docs/extract-pipeline.md §4)\n",
+                      frac(STG_PREAD) * 100.0);
+        out += line; ++hints;
+    }
+    if (frac(STG_PWRITE) > 0.40) {
+        std::snprintf(line, sizeof line,
+                      "arch profile hint: destination writes are %.0f%% of busy time — "
+                      "target bandwidth-bound; page-cache hygiene (fadvise/DIRECT) is the "
+                      "lever, not threads (docs/extract-pipeline.md §7.2)\n",
+                      frac(STG_PWRITE) * 100.0);
+        out += line; ++hints;
+    }
+    if (util < 0.25 && rt <= 0.30 && frac(STG_PERMIT_WAIT) <= 0.15) {
+        std::snprintf(line, sizeof line,
+                      "arch profile hint: workers are only %.0f%% busy and no stage dominates "
+                      "— stalls sit between spans (kernel I/O waits): raise --depth (now %d)\n",
+                      util * 100.0, std::max(1, opts.depth));
+        out += line; ++hints;
+    }
+    if (hints == 0)
+        out += "arch profile hint: no single dominant bottleneck\n";
+    return out;
+}
 
 std::vector<reader::listing_entry> reader::list() const {
     std::vector<listing_entry> out;
@@ -532,164 +776,212 @@ void reader::extract(const std::filesystem::path& arc_path,
     d->extract_one(d->find_entry(arc_path.string()), dest, codecs);
 }
 
-// Phase 4 item 23: extraction pipeline — per-file parallel read + decompress
-// + write across *files* (same network-FS rationale as the write side).
-// Waves (docs/api.md): directories → files/symlinks (pool) → hardlinks →
-// directory metadata.
+// Phase 4 item 23 + Phase 10 (docs/extract-pipeline.md §3): extraction waves —
+// dirs → files/symlinks/devices → hardlinks → dir metadata. Wave ORDER is
+// still load-bearing; concurrency now has two knobs: the wave pools are
+// options.depth workers wide (hides output-side open/metadata round-trips),
+// while CRC+decompress runs gated to options.threads permits (CPU), and the
+// archive `pread` sits outside the gate. Jobs iterate in archive LAYOUT
+// order with by_path last-occurrence-wins dedup (sequential source reads).
 void reader::extract_all(std::filesystem::path dest) const {
     std::error_code ec;
     fs::create_directories(dest, ec);
     if (ec) throw std::system_error(ec, "cannot create " + dest.string());
 
-    // Unique jobs: last section wins for repeated paths (append archives);
-    // duplicate-path earlier entries are fully overwritten anyway.
+    const std::size_t nworkers = static_cast<std::size_t>(std::max(1, d->opts.depth));
+    const std::uint64_t t0 = d->opts.profile ? impl::now_ns() : 0;
+
+    // Unique jobs in layout order: an entry runs iff it is the by_path
+    // winner (earlier duplicates at the same path are overwritten anyway).
     std::vector<impl::entry_location> dirs, files, hardlinks;
-    for (const auto& [path, loc] : d->by_path) {
-        const auto& e = d->sections[loc.section].entries[loc.index];
-        if (S_ISDIR(e.mode)) dirs.push_back(loc);
-        else if (S_ISREG(e.mode) && e.link_target_id != 0) hardlinks.push_back(loc);
-        else if (S_ISREG(e.mode) || S_ISLNK(e.mode) || S_ISFIFO(e.mode) ||
-                 S_ISBLK(e.mode) || S_ISCHR(e.mode))
-            files.push_back(loc);
-        // (S_IFSOCK intentionally not recreated.)
+    for (std::size_t si = 0; si < d->sections.size(); ++si) {
+        const auto& sec = d->sections[si];
+        for (std::size_t ei = 0; ei < sec.entries.size(); ++ei) {
+            const auto& e = sec.entries[ei];
+            const auto name = zstr(d->strings(si), e.path_id, "entry path");
+            const auto it = d->by_path.find(std::string(name));
+            if (it == d->by_path.end() || it->second.section != si ||
+                it->second.index != ei)
+                continue; // superseded by a later section
+            const impl::entry_location loc{si, ei};
+            if (S_ISDIR(e.mode)) dirs.push_back(loc);
+            else if (S_ISREG(e.mode) && e.link_target_id != 0) hardlinks.push_back(loc);
+            else if (S_ISREG(e.mode) || S_ISLNK(e.mode) || S_ISFIFO(e.mode) ||
+                     S_ISBLK(e.mode) || S_ISCHR(e.mode))
+                files.push_back(loc);
+            // (S_IFSOCK intentionally not recreated.)
+        }
     }
 
-    // Wave 1: directories (+ parents serially so workers never mkdir-race).
-    for (const auto& loc : dirs) {
-        const auto& e = d->sections[loc.section].entries[loc.index];
-        fs::create_directories(dest / std::string(
-            zstr(d->strings(loc.section), e.path_id, "entry path")), ec);
-        if (ec) throw std::system_error(ec, "mkdir " + dest.string());
-    }
-
-    // Wave 2: files/symlinks/devices on the pool.
+    // Wave 1: directories. Layout order guarantees parents-before-children,
+    // but the pool does not preserve it, so bucket by path depth and run
+    // the buckets in ascending order (parallel within a bucket ⇒ no
+    // mkdir races, no missing parents).
     {
-        int want = d->opts.threads > 0
-                       ? d->opts.threads
-                       : static_cast<int>(std::thread::hardware_concurrency());
-        if (want < 1) want = 1;
-        const auto nworkers = static_cast<std::size_t>(
-            std::min<std::size_t>(static_cast<std::size_t>(want), files.size()));
-
-        std::atomic<std::size_t> next{0};
-        std::atomic<bool> stop{false};
-        std::mutex err_mtx;
-        std::exception_ptr first_err;
-
-        auto worker = [&] {
-            impl::codec_cache codecs; // one per thread; codec construction is lazy
-            for (;;) {
-                if (stop.load(std::memory_order_acquire)) return;
-                const std::size_t i = next.fetch_add(1);
-                if (i >= files.size()) return;
-                try {
-                    const auto& loc = files[i];
-                    const auto& e = d->sections[loc.section].entries[loc.index];
-                    const auto name = zstr(d->strings(loc.section), e.path_id, "entry path");
-                    d->extract_one(loc, dest / std::filesystem::path(name), codecs);
-                } catch (...) {
-                    {
-                        std::lock_guard lk(err_mtx);
-                        if (!first_err) first_err = std::current_exception();
-                    }
-                    stop.store(true, std::memory_order_release);
-                    return;
-                }
-            }
-        };
-        std::vector<std::thread> pool;
-        pool.reserve(nworkers);
-        for (std::size_t i = 0; i < nworkers; ++i) pool.emplace_back(worker);
-        for (auto& t : pool) t.join();
-        if (first_err) std::rethrow_exception(first_err);
+        std::map<int, std::vector<std::size_t>> buckets;
+        for (std::size_t i = 0; i < dirs.size(); ++i) {
+            const auto& loc = dirs[i];
+            const auto& e = d->sections[loc.section].entries[loc.index];
+            const auto nm = std::filesystem::path(
+                std::string(zstr(d->strings(loc.section), e.path_id, "entry path")));
+            int depth = 0;
+            for (auto it = nm.begin(); it != nm.end(); ++it) ++depth;
+            buckets[depth].push_back(i);
+        }
+        for (auto& [depth, idx] : buckets) {
+            auto err = run_jobs(idx.size(), nworkers, [&](std::size_t k) {
+                const auto& loc = dirs[idx[k]];
+                const auto& e = d->sections[loc.section].entries[loc.index];
+                const auto name = zstr(d->strings(loc.section), e.path_id, "entry path");
+                impl::span s(&*d, impl::STG_OPEN);
+                std::error_code mkec;
+                fs::create_directories(dest / std::filesystem::path(name), mkec);
+                if (mkec) throw std::system_error(mkec, "mkdir " + dest.string());
+            });
+            if (err) std::rethrow_exception(err);
+        }
     }
 
-    // Wave 3: hardlink duplicates — canonical owners now exist.
-    {
-        impl::codec_cache codecs;
-        for (const auto& loc : hardlinks) {
-            const auto& sec = d->sections[loc.section];
-            const auto& e = sec.entries[loc.index];
+    // Wave 2: files/symlinks/devices. extract_one opens the output file
+    // once and keeps the fd through metadata restore (Phase 10 §3.2 step 1);
+    // depth workers overlap the create-path RTs, threads gate the CPU part.
+    if (auto err = run_jobs(files.size(), nworkers, [&](std::size_t i) {
+            thread_local impl::codec_cache codecs; // per-worker, lazy
+            const auto& loc = files[i];
+            const auto& e = d->sections[loc.section].entries[loc.index];
+            const auto name = zstr(d->strings(loc.section), e.path_id, "entry path");
+            d->extract_one(loc, dest / std::filesystem::path(name), codecs);
+        }))
+        std::rethrow_exception(err);
+
+    // Wave 3: hardlink duplicates — canonical owners now exist. link() is
+    // one create-path RT each: pooled too.
+    if (auto err = run_jobs(hardlinks.size(), nworkers, [&](std::size_t i) {
+            const auto& loc = hardlinks[i];
+            const auto& e = d->sections[loc.section].entries[loc.index];
             const auto name = zstr(d->strings(loc.section), e.path_id, "entry path");
             const auto owner = std::string(
                 zstr(d->strings(loc.section), e.link_target_id, "hardlink target"));
             const auto owner_dest = dest / std::filesystem::path(owner);
             const auto target_dest = dest / std::filesystem::path(name);
             std::error_code rmec;
-            fs::remove(target_dest, rmec);
+            {
+                impl::span s(&*d, impl::STG_OPEN);
+                fs::remove(target_dest, rmec);
+            }
             if (!fs::exists(owner_dest)) {
                 // Canonical path was in a dropped/failed section: fall back
                 // to extracting the owner's blocks under the duplicate name.
+                thread_local impl::codec_cache codecs;
                 const auto& oloc = d->find_entry(owner);
-                d->extract_data(oloc,
-                                static_cast<std::int64_t>(d->sections[oloc.section].entries[oloc.index].block_list_offset),
-                                static_cast<std::int64_t>(d->sections[oloc.section].entries[oloc.index].block_count),
-                                target_dest, codecs);
-                continue;
+                const int out = ::open(target_dest.c_str(),
+                                       O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                if (out < 0)
+                    throw std::system_error(errno, std::generic_category(),
+                                            "cannot create " + target_dest.string());
+                try {
+                    d->extract_data(oloc,
+                        static_cast<std::int64_t>(d->sections[oloc.section].entries[oloc.index].block_list_offset),
+                        static_cast<std::int64_t>(d->sections[oloc.section].entries[oloc.index].block_count),
+                        out, target_dest, codecs);
+                } catch (...) { ::close(out); throw; }
+                ::close(out);
+                return;
             }
+            impl::span s(&*d, impl::STG_META);
             if (::link(owner_dest.c_str(), target_dest.c_str()) != 0)
                 throw std::system_error(errno, std::generic_category(),
                                         "hardlink " + target_dest.string());
-        }
-    }
+            d->files_done.fetch_add(1, std::memory_order_relaxed);
+        }))
+        std::rethrow_exception(err);
 
-    // Wave 4: directory metadata (children are all in place now).
-    for (auto it = dirs.rbegin(); it != dirs.rend(); ++it) {
-        const auto& loc = *it;
-        const auto& sec = d->sections[loc.section];
-        const auto& e = sec.entries[loc.index];
-        const auto name = zstr(d->strings(loc.section), e.path_id, "entry path");
-        const auto dpath = dest / std::filesystem::path(name);
-        ::chmod(dpath.c_str(), e.mode & 07777);
-        if (::chown(dpath.c_str(), e.uid, e.gid) != 0 && errno != EPERM && errno != EINVAL)
-            SPDLOG_DEBUG("chown dir {} failed: {}", dpath.c_str(), strerror(errno));
-        struct timespec times[2] = {{static_cast<time_t>(e.atime_sec), e.atime_nsec},
-                                    {static_cast<time_t>(e.mtime_sec), e.mtime_nsec}};
-        ::utimensat(AT_FDCWD, dpath.c_str(), times, 0);
-        if (e.xattr_id)
-            util::write_xattrs(dpath, d->strings(loc.section).substr(e.xattr_id));
-        if (e.acl_id) // access + (for dirs) default ACL
-            util::write_acl(dpath, d->strings(loc.section).substr(e.acl_id));
+    // Wave 4: directory metadata (children must be in place first; order
+    // among directories is irrelevant — pool it). Reverse iteration keeps
+    // the historical children-before-parents application order.
+    if (auto err = run_jobs(dirs.size(), nworkers, [&](std::size_t i) {
+            const auto& loc = dirs[dirs.size() - 1 - i];
+            const auto& sec = d->sections[loc.section];
+            const auto& e = sec.entries[loc.index];
+            const auto name = zstr(d->strings(loc.section), e.path_id, "entry path");
+            const auto dpath = dest / std::filesystem::path(name);
+            impl::span s(&*d, impl::STG_META);
+            ::chmod(dpath.c_str(), e.mode & 07777);
+            if (::chown(dpath.c_str(), e.uid, e.gid) != 0 && errno != EPERM && errno != EINVAL)
+                SPDLOG_DEBUG("chown dir {} failed: {}", dpath.c_str(), strerror(errno));
+            struct timespec times[2] = {{static_cast<time_t>(e.atime_sec), e.atime_nsec},
+                                        {static_cast<time_t>(e.mtime_sec), e.mtime_nsec}};
+            ::utimensat(AT_FDCWD, dpath.c_str(), times, 0);
+            if (e.xattr_id)
+                util::write_xattrs(dpath, d->strings(loc.section).substr(e.xattr_id));
+            if (e.acl_id) // access + (for dirs) default ACL
+                util::write_acl(dpath, d->strings(loc.section).substr(e.acl_id));
+        }))
+        std::rethrow_exception(err);
+
+    if (d->opts.profile) {
+        d->wall_ns.fetch_add(impl::now_ns() - t0);
+        auto report = d->profile_report();
+        std::fputs(report.c_str(), stderr);
+        std::fflush(stderr);
     }
 }
 
-// verify: read + CRC + decompress every data-bearing entry into the sink.
-// Directories/symlinks/FIFOs/devices carry no blocks (the constructor's
-// metadata CRC already covers their entries).
+// verify (Phase 8 item 32) + Phase 10: read + CRC + decompress every
+// data-bearing entry into the sink — now on the same two-knob pool as
+// extraction (depth workers, threads-gated CPU). Errors are recorded in
+// per-job slots so the reported order matches the serial implementation.
 std::vector<std::string> reader::impl::verify_all() const {
-    std::vector<std::string> errors;
-    codec_cache codecs;
-    for (std::size_t si = 0; si < sections.size(); ++si) {
-        const auto& sec = sections[si];
-        for (std::size_t ei = 0; ei < sec.entries.size(); ++ei) {
-            const auto& e = sec.entries[ei];
+    struct job { std::size_t si, ei; std::string name; };
+    std::vector<job> jobs;
+    for (std::size_t si = 0; si < sections.size(); ++si)
+        for (std::size_t ei = 0; ei < sections[si].entries.size(); ++ei) {
+            const auto& e = sections[si].entries[ei];
             if (!S_ISREG(e.mode)) continue;
-            const auto name = zstr(strings(si), e.path_id, "entry path");
+            jobs.push_back({si, ei,
+                std::string(zstr(strings(si), e.path_id, "entry path"))});
+        }
+
+    std::vector<std::string> errs(jobs.size());
+    const std::size_t nworkers = static_cast<std::size_t>(std::max(1, opts.depth));
+    const std::uint64_t t0 = opts.profile ? now_ns() : 0;
+
+    run_jobs(jobs.size(), nworkers, [&](std::size_t k) {
+        const auto& j = jobs[k];
+        try {
+            const auto& e = sections[j.si].entries[j.ei];
             std::int64_t first = static_cast<std::int64_t>(e.block_list_offset);
             std::int64_t count = static_cast<std::int64_t>(e.block_count);
+            entry_location dloc{j.si, j.ei};
             if (e.link_target_id != 0) { // hardlink: verify via owner blocks
                 const auto owner = std::string(
-                    zstr(strings(si), e.link_target_id, "hardlink target"));
-                try {
-                    const auto& oloc = find_entry(owner);
-                    first = static_cast<std::int64_t>(
-                        sections[oloc.section].entries[oloc.index].block_list_offset);
-                    count = static_cast<std::int64_t>(
-                        sections[oloc.section].entries[oloc.index].block_count);
-                    extract_data(oloc, first, count, name, codecs, /*sink=*/true);
-                } catch (const std::exception& ex) {
-                    errors.push_back(std::string(name) + ": " + ex.what());
-                }
-                continue;
+                    zstr(strings(j.si), e.link_target_id, "hardlink target"));
+                dloc = find_entry(owner);
+                first = static_cast<std::int64_t>(
+                    sections[dloc.section].entries[dloc.index].block_list_offset);
+                count = static_cast<std::int64_t>(
+                    sections[dloc.section].entries[dloc.index].block_count);
             }
-            try {
-                extract_data({si, ei}, first, count, name, codecs, /*sink=*/true);
-            } catch (const std::exception& ex) {
-                errors.push_back(std::string(name) + ": " + ex.what());
-            }
+            // sink: no output fd at all (the /dev/null open + pwrites are gone)
+            thread_local impl::codec_cache codecs; // per-worker, lazy
+            extract_data(dloc, first, count, /*out_fd=*/-1, j.name,
+                         codecs, /*sink=*/true);
+        } catch (const std::exception& ex) {
+            errs[k] = j.name + ": " + ex.what();
         }
+    });
+
+    if (opts.profile) {
+        wall_ns.fetch_add(now_ns() - t0);
+        auto report = profile_report();
+        std::fputs(report.c_str(), stderr);
+        std::fflush(stderr);
     }
-    return errors;
+
+    std::vector<std::string> out;
+    for (auto& s : errs)
+        if (!s.empty()) out.push_back(std::move(s));
+    return out;
 }
 
 std::vector<std::string> reader::verify_all() const { return d->verify_all(); }

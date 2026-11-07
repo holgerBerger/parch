@@ -279,15 +279,21 @@ static void run_arch(const cfg& c, uint64_t inb) {
         const auto out = c.data / c.workload / "out_arch";
         fs::remove_all(out);
         time_ctx t; t.start();
-        arch::reader::options ro;
-        ro.threads = c.threads > 0 ? c.threads : 0;
+        arch::reader::options ro;      // Phase 10: depth = files in flight,
+        ro.threads = c.threads;        // threads = decode permits
+        ro.depth = static_cast<int>(c.depth);
+        ro.profile = std::getenv("ARCH_BENCH_PROFILE") != nullptr;
         arch::reader r(arc, ro);
         r.extract_all(out);
         report("arch", c, "extract", inb, 0, t);
     }
     if (c.op == "verify" || c.op == "all") {
         time_ctx t; t.start();
-        arch::reader r(arc);
+        arch::reader::options ro;
+        ro.threads = c.threads;
+        ro.depth = static_cast<int>(c.depth);
+        ro.profile = std::getenv("ARCH_BENCH_PROFILE") != nullptr;
+        arch::reader r(arc, ro);
         auto errs = r.verify_all();
         double s = t.secs();
         std::printf(

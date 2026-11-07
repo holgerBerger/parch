@@ -167,12 +167,21 @@ wins — the newest version of the name is what lands on disk.
 
 ```cpp
 struct options {
-    int threads = 0;   // extract_all worker pool size; 0 → hardware concurrency
+    int  threads = 0;    // CRC+decompress permits (CPU knob); 0 → hardware concurrency
+    int  depth   = 32;   // extract_all/verify_all workers: files in flight (latency knob)
+    bool profile = false; // per-stage timing report, see profile_report()
 };
 ```
 
-`threads` bounds the **extract_all** per-file worker pool (see below); a
-single `extract()` call always blocks the calling thread.
+Two independent concurrency knobs (Phase 10, `docs/extract-pipeline.md`):
+`depth` sizes the per-file worker pools that hide output-side round-trips
+(create/open, metadata) on network filesystems — raise it when the profile
+shows RT stalls; `threads` caps concurrent CRC+decompress work — the CPU
+budget. Archive `pread`s run outside the `threads` gate so source-I/O
+concurrency scales with `depth`. A single `extract()` call always blocks the
+calling thread. With `profile`, a per-stage timing breakdown plus tuning
+hints is printed to stderr at the end of `extract_all`/`verify_all` and is
+also available via `profile_report()` (empty string when off).
 
 Opens the archive read-only. Validates the footer (self-check + signature
 CRC), reads the TOC table, and parses **section metadata only** (headers,
@@ -222,17 +231,23 @@ Extraction pipeline — the mirror of the Phase 3 write side, with the same
 network-FS rationale (per-file latency hidden by running **files in
 parallel**, each file's blocks streamed in order). Four waves:
 
-1. **Directories** created serially (sorted) so workers never race on `mkdir`.
-2. **Regular files, symlinks, FIFOs, devices** extracted on the worker pool
-   (`options.threads`, default `hardware_concurrency`); each worker owns its
-   codec instances (one decompressor per thread — decompressors are not
-   thread-safe). The first failing job is captured and rethrown after the
-   pool drains; remaining jobs stop early.
-3. **Hardlink duplicates** linked (`link()`) to their canonical owner; if the
-   owner is missing (dropped section), the owner's blocks are extracted under
-   the duplicate's name instead.
-4. **Directory metadata** (mode/owner/times/xattrs) applied in reverse order,
-   after all children are in place.
+1. **Directories** created on the `depth`-wide pool, bucketed by path depth
+   (shallowest bucket first) so parents always exist before children and no
+   two workers `mkdir` the same path.
+2. **Regular files, symlinks, FIFOs, devices** extracted on the same pool in
+   archive **layout order** (sequential source reads); each worker owns its
+   codec instances (thread-local — decompressors are not thread-safe). The
+   output file is opened **once** and its fd is reused for data, metadata
+   (`fchmod`/`fchown`/`futimens`) and xattr/ACL restore (`fsetxattr`,
+   `acl_set_fd`) — no re-open per file (Phase 10). CRC+decompress runs under
+   the `options.threads` permit gate; the archive `pread` and the output
+   `pwrite` sit outside it. The first failing job is captured and rethrown
+   after the pool drains; remaining jobs stop early.
+3. **Hardlink duplicates** linked (`link()`) to their canonical owner, also
+   pooled; if the owner is missing (dropped section), the owner's blocks are
+   extracted under the duplicate's name instead.
+4. **Directory metadata** (mode/owner/times/xattrs/ACLs) applied in reverse
+   order on the pool, after all children are in place.
 
 Paths are resolved through the last-occurrence-wins map, so a
 multi-section (appended) archive extracts its newest versions. Empty archive
@@ -242,8 +257,10 @@ regions never touched. Archive structure preserved rooted at `dest`.
 
 Full data-integrity check without writing any output: reads and CRC-verifies
 every block of every regular-file and hardlink entry (decompression included)
-into a `/dev/null` sink, then checks each file checksum. Returns one error
-string per failing entry (`"name: reason"`, block index included where
+into a discard sink, then checks each file checksum. Runs on the same
+two-knob pool as `extract_all` (`depth` files in flight, `threads` decode
+permits); reported errors keep the same order as the serial walk. Returns one
+error string per failing entry (`"name: reason"`, block index included where
 relevant); empty means the data is intact. Metadata-level validity
 (footer/TOC-table/section CRCs) is already enforced by the constructor, so
 `verify_all()` is the complementary *data-block* pass. Hardlink duplicates
@@ -575,7 +592,10 @@ opts:
   -c, --compressor NAME   zstd (default) or none (store)
   -l, --level N           compression level (default 3)
   -j, --threads N         compression / extraction workers (default 4)
-      --depth N           files in flight in the I/O pipeline (default 32)
+      --depth N           files in flight: I/O pipeline (create) / extract+verify
+                          workers (default 32)
+      --profile           per-stage timing report + tuning hints on stderr
+                          (extract, verify)
       --dedup             within-section content dedup (XXH3-128)
       --no-sync           skip fsync barriers (faster, less durable)
       --no-sparse         store holes as zero-filled blocks (archive stays v0.2)
@@ -595,9 +615,12 @@ opts:
   in `ls -l`-style: type+permissions, size, mtime, path, and ` -> target`
   for symlinks/hardlinks.
 - `extract` maps `-j` onto `reader::options.threads` (when given; otherwise
-  the reader defaults to hardware concurrency) and runs the four-wave
-  `extract_all` pipeline.
-- `verify` runs the constructor's metadata validation plus `reader::verify_all()`;
+  the reader defaults to hardware concurrency) and `--depth` onto
+  `reader::options.depth` (files in flight across the four waves);
+  `--profile` sets `reader::options.profile`. Runs the `extract_all`
+  pipeline.
+- `verify` maps the same reader options (`-j`, `--depth`, `--profile`) and
+  runs the constructor's metadata validation plus `reader::verify_all()`;
   one failing entry per line on **stdout**, summary on stderr; exit `0` when
   clean, `1` when any entry fails.
 - `--no-sparse` clears `writer::options.sparse` (holes stored densely, archive

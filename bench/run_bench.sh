@@ -34,7 +34,12 @@ sec "3. simulated network FS (LD_PRELOAD: 500 us per open + first read)"
 export NETFS_PREFIX="$DATA/small" NETFS_DELAY_US=500
 LD_PRELOAD="$SHIM" "$B" --workload=small --op=create --no-gen $C --threads=4 --depth=1
 LD_PRELOAD="$SHIM" "$B" --workload=small --op=create --no-gen $C --threads=4 --depth=32
-LD_PRELOAD="$SHIM" "$B" --workload=small --op=extract --no-gen --no-tar $C --threads=4
+# Phase 10: reader depth sweep (latency knob) — docs/extract-pipeline.md §3
+LD_PRELOAD="$SHIM" "$B" --workload=small --op=extract --no-gen --no-tar $C --threads=4 --depth=1
+LD_PRELOAD="$SHIM" "$B" --workload=small --op=extract --no-gen --no-tar $C --threads=4 --depth=4
+LD_PRELOAD="$SHIM" "$B" --workload=small --op=extract --no-gen --no-tar $C --threads=4 --depth=32
+LD_PRELOAD="$SHIM" "$B" --workload=small --op=extract --no-gen --no-tar $C --threads=4 --depth=128
+LD_PRELOAD="$SHIM" "$B" --workload=small --op=verify --no-gen --no-tar $C --threads=4 --depth=32
 unset LD_PRELOAD NETFS_PREFIX NETFS_DELAY_US
 
 sec "4. memory profiling: writer threads sweep (big workload, 1 GiB, 4 MiB blocks)"

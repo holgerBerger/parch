@@ -75,7 +75,7 @@ compression and random per-file access. See `docs/format.md` for the full spec
 | CLI (`src/main.cpp`) | ✅ **Done (Phase 5)** — `create`/`append`/`list`/`extract`/`verify` with codec/level/threads/depth/dedup/durability/sparse flags; stderr diagnostics, stdout listings, exit codes 0/1/2; links the static lib with `--whole-archive` (compressor registration); `test/test_cli.cpp` covers roundtrips + error codes end-to-end |
 | Test plan (`docs/testing.md`) | ✅ Complete — 50+ planned future tests with priorities |
 | Benchmarks + memory profile (`docs/benchmarks.md`) | ✅ **Done (Phase 9)** — `bench/bench.cpp` (`arch_bench`) + `bench/netfs_delay.c` (LD_PRELOAD 500 µs open+first-read latency shim) + `bench/run_bench.sh` matrix; vs GNU tar 1.35 `--zstd -3`. Headline: pipeline create **28×** faster than tar/serial on many-small-files under simulated netfs latency (97.7 vs 3.5 MiB/s); extract beats tar on every workload (1.3–2.4×); writer RSS 50/97/214 MiB at `-j 1/4/12` (plateau at `-j 4`); dedup index measured ~0.14 KiB/entry ⇒ ~36 GiB/PiB unique (freed per `finalize_section()`, no spill index in v1). |
-| Extraction pipeline (`docs/extract-pipeline.md`) | 📐 **Design only (Phase 10, optional)** — extract is RT-bound under netfs latency (13.9 MiB/s, benchmarks §3). Option A: fd-handoff (kill the metadata re-open), fd-based xattr/ACL restore, `options.depth`/`threads` split (~32 files in flight vs 4 decode permits), pooled waves 1/3/4 + `verify_all` → expected ~5× under latency, ~0 local change. Option B (staged read/codec/write pipeline à la `pipeline.cpp`) gated on a real-NFS measurement. Post-v1 candidate, not yet scheduled. |
+| Extraction pipeline (`docs/extract-pipeline.md`) | ✅ **Done (Phase 10, optional)** — Option A implemented: fd handoff (metadata re-open gone), fd-based xattr/ACL (`fsetxattr`/`acl_set_fd`), two-knob reader (`options.depth` = files in flight, `options.threads` = decode permits), pooled waves 1/3/4 + parallel `verify_all`, optional `options.profile` per-stage timing report with tuning hints. Measured **15×** extract under 500 µs simulated latency (13.9 → 210 MiB/s at depth 32; 295 at 128 — design expected ~5×); local trade-off documented (benchmarks §3.1: use `--depth 4` locally). Option B (staged pipeline) remains gated on a real-NFS bandwidth measurement. |
 
 ## Archive format (summary)
 
@@ -167,9 +167,10 @@ docs/
 > files under simulated netfs latency; extract faster than tar on every
 > workload) and documented the memory profile (`docs/benchmarks.md`).
 > Remaining: **none required** — all v1 phases done; feature-complete.
-> An optional **Phase 10** (extraction pipeline, `docs/extract-pipeline.md`)
-> is designed but unimplemented: ~5× extract under netfs latency via
-> double-open removal + an fd/RT-concurrency split (`options.depth`).
+> **Phase 10 (optional, extraction pipeline) is implemented** — Option A
+> of `docs/extract-pipeline.md`: double-open removal + fd/RT-concurrency
+> split (`options.depth`) + optional `--profile` timing report; measured
+> 15× extract under simulated netfs latency (210 MiB/s at depth 32).
 >
 > **Design decisions frozen (2026-11):** io_uring demoted to an optional
 > backend (`ARCH_WITH_URING`, default OFF) — the primary I/O path is a
@@ -467,7 +468,7 @@ block CRCs + decompress roundtrip, dedup single-store, tree relative paths).
 > sections stay self-contained) and **per-file zstd multithreading** as a
 > parallelism knob (the block pool owns parallelism; `nbWorkers=1`).
 
-### Phase 10 (optional): Extraction pipeline — 📐 DESIGN (2026-11)
+### Phase 10 (optional): Extraction pipeline — ✅ DONE (2026-11, Option A)
 34. ✅ **Design** — `docs/extract-pipeline.md`: Phase 9 showed extract is
     round-trip-bound under netfs latency (13.9 vs 97.7 MiB/s create) —
     per file today: open output, write blocks, **re-open** it for
@@ -492,9 +493,22 @@ block CRCs + decompress roundtrip, dedup single-store, tree relative paths).
     restore is one-OST-cursor-bound, stage separation + `block_permits`
     as an explicit BDP dial (+ fadvise/O_DIRECT page-cache hygiene) are
     the only way to approach aggregate OST bandwidth.
-35. ⬜ **Implement Option A** (steps in docs/extract-pipeline.md §3.2,
-    sequencing in §6; §7.1 amendments if the target is Lustre/GPFS) —
-    starts only when scheduled post-v1.
+35. ✅ **Implement Option A** (2026-11) — all steps of §3.2 landed, incl.
+    the §7.1 amendments (`pread` outside the decode permit; wave-1
+    directory bucketing by path depth keeps parents-before-children under
+    pooling): `reader::options{threads, depth, profile}`, single-fd
+    `extract_one` (data + `fchmod`/`fchown`/`futimens` + `fsetxattr`/
+    `acl_set_fd` on one descriptor), pooled waves 1/3/4 + parallel
+    `verify_all` with job-order error parity, `arch extract/verify
+    --depth/--profile` CLI flags, bench depth sweep. Acceptance exceeded:
+    210 MiB/s at depth 32 under the 500 µs shim (target ~70–85; Phase 9
+    baseline 13.9). Profiler reports per-stage ns + ops with tuning hints
+    (RT share → raise depth; permit wait → raise -j or lower -l; CPU share
+    → more cores; read/write share → bandwidth walls). 93/93 default +
+    99/99 `ARCH_WITH_URING=ON` tests; ASan/UBSan/TSan clean; 4 new
+    `[phase10]` tests (depth×threads byte-identity, profile contents +
+    cumulative counters, fd-based xattr/mode restore, verify ordering
+    parity). Option B not implemented — gate unchanged (needs real NFS).
 
 
 ## Dependencies

@@ -1,6 +1,10 @@
 # Extraction Pipeline Design (Phase 10, optional)
 
-Status: **design** — implementation not started. Motivation: Phase 9
+Status: **Option A implemented (2026-11, PLAN item 35)** — measured 15×
+extract under the 500 µs shim (13.9 → 210 MiB/s at `depth=32`, 295 at 128;
+expected ~5×; full data + local trade-off in `docs/benchmarks.md` §3.1).
+Option B (§4) remains gated on a real-NFS bandwidth measurement. Original
+motivation below: Phase 9
 benchmark (`docs/benchmarks.md` §3, conclusion 6): under 500 µs simulated
 netfs latency, `arch create` reaches 97.7 MiB/s (pipeline) but
 `extract_all` only 13.9 MiB/s — extraction parallelizes *decompression*
@@ -168,6 +172,42 @@ stacks/contexts (~40 MiB) — bounded and off the hot path.
 - No separate block-staging RAM pool — the decode semaphore bounds it
   well enough at these shapes (see §4 for when it isn't).
 - Public behavior, format, and wave semantics unchanged.
+
+### 3.5 Implemented addition — optional stage profiling (`options.profile`)
+
+Not in the original design: every `depth` worker wraps its stage bodies
+in an RAII `span` (`STG_OPEN`, `STG_PREAD`, `STG_CRC`, `STG_DECODE`,
+`STG_PWRITE`, `STG_META`, `STG_PERMIT_WAIT`) recording cumulative ns+ops
+into relaxed atomics (off cost: one bool test; permit-wait timing is the
+one always-on-path measurement guarded by the flag). `profile_report()`
+(public) returns a per-stage table + worker utilization + **tuning
+hints**:
+
+| signal | hint |
+|---|---|
+| RT stages (`create+open`+`metadata`) > 30 % of busy | latency-bound → raise `--depth` (at ≥128: the FS metadata rate is the floor) |
+| `permit wait` > 15 % of busy | `threads` (decode) is the bottleneck → raise `-j` or lower `-l` |
+| `crc32c`+`decompress` > 50 % | CPU-bound → more `-j` / trade ratio for speed |
+| `archive read` > 50 % | source bandwidth/latency wall — single-huge-file restore is exactly Option B's gap (§7.2) |
+| `write out` > 40 % | destination bandwidth wall → cache hygiene, not threads (§7.2) |
+| utilization < 25 % with no dominant stage | stalls *between* spans → raise `--depth` |
+
+The report is emitted to stderr at the end of `extract_all`/`verify_all`
+when the flag is on (`arch extract/verify --profile`;
+`ARCH_BENCH_PROFILE=1` for the bench). Counters are cumulative across
+both ops on one reader. Measured payoff (§3.1 addendum): under the shim
+the report shows 97.9 % of busy in `create+open` at 98.5 % utilization —
+pure overlapped latency, confirming A's model; raising `-j` 4→16 changes
+nothing at `depth=32`, which is the two-knob split working as designed.
+
+**Actual vs §3.3 predictions (2026-11, implemented):** 210 MiB/s at
+`depth=32` (predicted 70–85 — the single-fd handoff plus out-of-permit
+`pread` beat the extrapolation; 20 000 × 1 RT ÷ 32 ≈ 0.31 s matches the
+measured 0.37 s almost exactly). Local warm `small` *regressed* at the
+default depth (359 vs 665 MiB/s, §3.1 addendum): on low-latency storage
+32 concurrent creators just contend — `--depth 4` recovers ~604 MiB/s.
+The profile report identifies this correctly (RT stage dominates but
+per-op time is inflated), and the hint text stands as designed.
 
 ## 4. Option B — staged `arch::io::extract_pipeline` (only if B is needed)
 

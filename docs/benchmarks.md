@@ -34,14 +34,21 @@ stream while its per-file cost is fully serial.
 | workload | op | tar --zstd -3 | tar (store) | arch -c zstd -l3 | arch store |
 |---|---|---|---|---|---|
 | small | create MiB/s | 876.7 | 870.4 | **104.2** | |
-| small | extract MiB/s | 436.6 | | **665.1** | |
-| small | verify MiB/s | | | 779.6 | |
+| small | extract MiB/s | 436.6 | | 665.1 (P9) → 307.7¹ | |
+| small | verify MiB/s | | | 1576.0¹ | |
 | mixed | create MiB/s | 1675.7 | 1954.3 | **1124.8** | |
-| mixed | extract MiB/s | 2019.7 | | **4847.3** | |
-| mixed | verify MiB/s | | | 2459.5 | |
+| mixed | extract MiB/s | 2019.7 | | 4847.3 (P9) → 3797.8¹ | |
+| mixed | verify MiB/s | | | 5651.3¹ | |
 | big | create MiB/s | 1701.4 | 1819.0 | **1221.3** | |
-| big | extract MiB/s | 2407.3 | | **3159.4** | |
-| big | verify MiB/s | | | 2480.7 | |
+| big | extract MiB/s | 2407.3 | | **3213.1**¹ | |
+| big | verify MiB/s | | | 4383.6¹ | |
+
+¹ **Re-measured post-Phase 10** (2026-11) with the two-knob reader at the
+`--depth 32` default. Extract pays a local-contention cost on many-small-
+file trees (32 concurrent creators vs the old 4-worker pool): on `small`,
+`--depth 4` recovers 604.6 MiB/s (§3.1 has the full sweep; Phase 9 values
+are in parentheses). Verify roughly **2× improved** everywhere — the
+parallel sink pays no output RTs at all.
 
 (Verify has no tar equivalent — the closest is `zstd -t` + full extract.)
 
@@ -53,10 +60,12 @@ Reading the table:
   `pwrite`, and the fixed 4-worker compression pool cannot saturate what
   tar gets from a single sequential stream + one big zstd window. No
   correctness cost — just ~40 % less raw local throughput.
-- **Extract is faster than tar on every workload** (1.3–2.4×), because
-  the reader decompresses independent blocks on `threads` workers and
-  `pwrite`s them at their final offsets — no ordering constraint, no
-  temp re-stream — while GNU tar+zstd is strictly serial.
+- **Extract is faster than tar on every workload** (1.3–1.9× at local
+  defaults; 1.4× on `small` with `--depth 4`), because the reader
+  decompresses independent blocks on `threads` workers and `pwrite`s
+  them at their final offsets — no ordering constraint, no temp
+  re-stream — while GNU tar+zstd is strictly serial. Locally the deep
+  default costs `small` (0.70× at depth 32): see the ¹ note and §3.1.
 - On `small`, create is latency/CPU-bound on per-file work (open, fstat,
   xattr round-trips, 20 000 tiny zstd frames), not disk-bound. The same
   workload under injected latency (§3) is where the design pays off.
@@ -103,7 +112,58 @@ Workload: `small` (20 000 files, 80 MiB).
   ~5.6 s. Reader extraction writes are not overlapped at the open level
   (one open + writes per output file); parallelism here is capped by the
   threads knob, not the archive format. A deeper extraction pipeline is a
-  possible future win, out of scope for v1.
+  possible future win, out of scope for v1. *(Realised in Phase 10 — see
+  §3.1 below.)*
+
+### 3.1 Phase 10 addendum — extraction pipeline (Option A), 2026-11
+
+Same harness, same 500 µs shim, `small` workload, `-j 4`; reader now has
+separate `--depth` (files in flight) / `threads` (decode permits) knobs,
+single-fd handoff (no metadata re-open), fd-based xattr/ACL (see
+`docs/extract-pipeline.md`):
+
+| config (extract, 500 µs sim) | rate | vs Phase 9 |
+|---|---|---|
+| depth=1 (worst case; old pool was 4-wide) | 11.4 s — 6.9 MiB/s | |
+| depth=4 (≈ old effective behaviour) | 2.85 s — 27.4 MiB/s | 2.0× |
+| **depth=32 (new default)** | **0.37 s — 210.0 MiB/s** | **15×** |
+| depth=128 | 0.26 s — 295.8 MiB/s | 21× |
+| depth=32, no shim (local warm) | 0.22 s — 359.0 MiB/s | 1.04× |
+
+- The design expected ~5× (≈70–85 MiB/s); measured **15×** at the default
+  depth. The fd handoff removes one create-path RT per file and the
+  depth-wide pool hides the remaining ~1 (open + metadata) almost perfectly:
+  `--profile` at depth=32 reports 98.5 % worker utilisation with 97.9 % of
+  busy time in `create+open` — pure latency, all overlapped.
+- Local warm-cache extract barely moves (359 vs ~372 MiB/s Phase 9): Option
+  A targets RT-bound filesystems, exactly as designed (§2 non-goal held).
+- `threads` (4 → 16) changes nothing at depth=32 under latency — the CPU
+  gate was never the bottleneck, which is precisely what the two-knob split
+  and the profile hint ("output-side RTs are 98 % of worker time — raise
+  --depth") are for. Saturating deeper costs RSS (19.6 MiB at depth=128 vs
+  13.6 at 32 — per-file buffers), still trivially small.
+- `arch_bench` honours `ARCH_BENCH_PROFILE=1` to emit the profile report.
+
+Verify (local warm, `small`): 779.6 MiB/s (Phase 9) → **1523.6 MiB/s** at
+depth=32 — the sink path now pays no output RTs at all (no `/dev/null`
+open, no pwrites), so the win comes purely from concurrent archive
+`pread`s; under the 500 µs shim verify is essentially latency-immune
+already (1517.6 at depth=32 vs 647.6 at depth=1).
+
+**Local warm-cache trade-off** (measured, `small` extract, `-j 4`):
+depth=2 → 384.6, depth=4 → **604.6**, depth=8 → 486.9, depth=16 → 373.2,
+depth=32 → 356.8 MiB/s. On a low-latency filesystem the deep queue stops
+hiding RTs and starts costing: 32 workers hold ~256 MiB of in-flight raw +
+decoded buffers (mixed RSS 13 → 147 MiB) and thrash cache/memory bandwidth.
+`mixed` extract at default flags is ~10 % below Phase 9 for the same reason
+(4297 vs 4847 MiB/s at `-j 16`). **Tuning: on local storage run with
+`--depth 4`; the 32 default is sized for network filesystems, the
+project's target.** The Phase 10 profile makes this visible directly: the
+`small`/depth-32 local report shows create+open still the top stage but the
+op time inflated by contention (361 µs/op vs 60 at depth 8).
+`big` (one 1 GiB file) is unaffected — single-cursor workloads ignore the
+depth knob — and actually improved: 2407 → 2998 MiB/s (fd handoff +
+out-of-permit reads).
 
 ## 4. Memory profile
 
