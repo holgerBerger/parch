@@ -19,6 +19,7 @@
 #include <map>
 #include <fcntl.h>
 #include <unistd.h>
+#include <dirent.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <xxhash.h>
@@ -954,12 +955,12 @@ std::string writer::impl::profile_report() const
     const double src_rt = frac(STG_WALK) + frac(STG_OPEN) + frac(STG_META);
     if (src_rt > 0.30) {
         if (frac(STG_WALK) > 0.20)
-            add_hint("parch create hint: tree-walk discovery (readdir+lstat) is "
-                     "%.0f%% of worker time — the walk is streamed (creation "
-                     "already starts during traversal), so this is MDS RPC "
-                     "contention, not a barrier: fewer walk round-trips (d_type "
-                     "classification / cached statx) or a faster/spread MDS is "
-                     "the win\n", frac(STG_WALK) * 100.0);
+            add_hint("parch create hint: tree-walk discovery (readdir) is "
+                     "%.0f%% of worker time — the walk is streamed and "
+                     "stat-free (d_type/d_ino), so this is raw MDS load, "
+                     "not a barrier: a faster/spread MDS (directory "
+                     "striping) is the remaining win\n",
+                     frac(STG_WALK) * 100.0);
         else
             add_hint("parch create hint: source-side RTs (walk+open+xattr) are "
                      "%.0f%% of worker time — latency-bound: raise --depth "
@@ -1181,24 +1182,54 @@ void writer::add_tree(const std::filesystem::path& root, std::string store_prefi
     };
     std::vector<tree_item> items;
 
-    std::vector<std::pair<fs::path /*abs*/, std::string /*rel*/>> stack;
-    std::vector<std::pair<std::string, fs::directory_entry>> kids;
+    struct walk_entry {
+        fs::path abs;
+        std::string rel;
+        ino_t ino;               // d_ino from the parent's readdir
+        unsigned char dtype;     // d_type from the parent's readdir
+        dev_t dir_dev;           // st_dev of the containing directory
+    };
+    std::vector<walk_entry> stack;
 
-    auto walk_dir = [&](const fs::path& abs, const std::string& rel) {
-        kids.clear();
-        for (const auto& e : fs::directory_iterator(abs))
-            kids.emplace_back(rel.empty() ? e.path().filename().string()
-                                          : rel + "/" + e.path().filename().string(),
-                              e);
-        std::sort(kids.begin(), kids.end(),
-                  [](auto& a, auto& b) { return a.first < b.first; });
-        // Push in reverse so the LIFO stack pops them in sorted order — the
-        // first path of a shared inode (hardlink owner) is alphabetical-first.
-        for (auto it = kids.rbegin(); it != kids.rend(); ++it)
-            stack.emplace_back(fs::absolute(it->second.path()), it->first);
+    // Descend one directory with raw readdir(): d_type (classification) and
+    // d_ino (hardlink identity) ride inside the directory-read replies
+    // themselves — on Lustre straight from the MDT, no per-entry getattr.
+    // Pushing in reverse keeps the LIFO stack popping children in sorted
+    // (walk) order, so the first path of a shared inode is alphabetical-first.
+    auto walk_dir = [&](const fs::path& abs, const std::string& rel, dev_t dir_dev) {
+        std::vector<std::pair<std::string, std::pair<ino_t, unsigned char>>> kids;
+        DIR* dp = ::opendir(abs.c_str());
+        if (!dp) {
+            int e2 = errno;
+            SPDLOG_ERROR("opendir failed for {}: {}", abs.c_str(), strerror(e2));
+            throw std::system_error(e2, std::generic_category(), "opendir failed: " + abs.string());
+        }
+        errno = 0;  // readdir reports end-of-stream by nullptr + unchanged errno
+        while (const dirent* de = ::readdir(dp)) {
+            const std::string name = de->d_name;
+            if (name == "." || name == "..") continue;
+            kids.emplace_back(name, std::make_pair(
+                de->d_ino, static_cast<unsigned char>(de->d_type)));
+        }
+        const int e2 = errno;
+        ::closedir(dp);
+        if (e2 != 0) {
+            SPDLOG_ERROR("readdir failed for {}: {}", abs.c_str(), strerror(e2));
+            throw std::system_error(e2, std::generic_category(), "readdir failed: " + abs.string());
+        }
+        std::sort(kids.begin(), kids.end());
+        for (auto it = kids.rbegin(); it != kids.rend(); ++it) {
+            walk_entry we;
+            we.rel = rel.empty() ? it->first : rel + "/" + it->first;
+            we.abs = abs / it->first;
+            we.ino = it->second.first;
+            we.dtype = it->second.second;
+            we.dir_dev = dir_dev;
+            stack.push_back(std::move(we));
+        }
     };
 
-    walk_dir(fs::absolute(root), store_prefix);
+    walk_dir(fs::absolute(root), store_prefix, rst.st_dev);
 
     if (!store_prefix.empty()) {
         // tar stores the top directory first — mirror that: the root itself
@@ -1212,31 +1243,29 @@ void writer::add_tree(const std::filesystem::path& root, std::string store_prefi
         items.push_back(std::move(rit));
     }
 
-    // Streaming walk: next_item() discovers one entry per call (readdir when
-    // descending + lstat + readlink) in walk order. Feeding the pipeline as
-    // files are discovered — instead of a full collect pass first — keeps
-    // discovery round-trips off the critical path (they overlap block
-    // streaming) and lands the first archive bytes while the tree is still
-    // being walked. The STG_WALK timer accumulates discovery time only, so
-    // the profile stays meaningful even while interleaved with consumption.
-    auto next_item = [&](tree_item& it) -> bool {
-        if (stack.empty()) return false;
-        util::profile::span walk(d->T(impl::STG_WALK));
-        auto [abs, rel] = stack.back();
-        stack.pop_back();
-
-        it = tree_item{};
-        it.abs = std::move(abs);
-        it.rel = std::move(rel);
+    // Streaming walk: next_item() discovers one entry per call in walk order.
+    // Regular files — the overwhelming majority of entries — are NOT stat'ed
+    // here at all: classification comes from readdir d_type, hardlink
+    // identity from (containing dir's dev, d_ino), and size/mode/times are
+    // re-read authoritatively by the pipeline's post-open fstat (submit's
+    // size argument is only a slot estimate; 0 is fine). Only directories
+    // (real metadata entries), symlinks, specials and confirmed hardlink
+    // duplicates pay a getattr. Filesystems that leave d_type DT_UNKNOWN or
+    // d_ino zero (older NFS) fall back to the classic lstat classification —
+    // no regression, just no gain.
+    //
+    // The file's st_dev always equals its containing directory's: a mount
+    // point below here is itself a directory entry, stat'ed with its own dev
+    // before its children are pushed.
+    auto classify_stat = [&](tree_item& it) {
         if (::lstat(it.abs.c_str(), &it.st)) {
             int e2 = errno;
             SPDLOG_ERROR("lstat failed for {}: {}", it.abs.c_str(), strerror(e2));
             throw std::system_error(e2, std::generic_category(), "lstat failed: " + it.abs.string());
         }
-
         if (S_ISDIR(it.st.st_mode)) {
             it.kind = tree_item::kMeta;
-            walk_dir(it.abs, it.rel);
+            walk_dir(it.abs, it.rel, it.st.st_dev);
         } else if (S_ISLNK(it.st.st_mode)) {
             it.kind = tree_item::kSymlink;
             it.text = fs::read_symlink(it.abs).string();
@@ -1259,7 +1288,77 @@ void writer::add_tree(const std::filesystem::path& root, std::string store_prefi
         } else {
             it.kind = tree_item::kMeta; // blk/chr/fifo/sock: metadata-only
         }
-        return true;
+    };
+
+    auto next_item = [&](tree_item& it) -> bool {
+        if (stack.empty()) return false;
+        util::profile::span walk(d->T(impl::STG_WALK));
+        walk_entry we = std::move(stack.back());
+        stack.pop_back();
+
+        it = tree_item{};
+        it.abs = std::move(we.abs);
+        it.rel = std::move(we.rel);
+
+        switch (we.dtype) {
+        case DT_DIR:
+            if (::stat(it.abs.c_str(), &it.st)) { // mode/times: real entry data
+                int e2 = errno;
+                SPDLOG_ERROR("stat failed for {}: {}", it.abs.c_str(), strerror(e2));
+                throw std::system_error(e2, std::generic_category(), "stat failed: " + it.abs.string());
+            }
+            it.kind = tree_item::kMeta;
+            walk_dir(it.abs, it.rel, it.st.st_dev);
+            return true;
+        case DT_LNK:
+            if (::lstat(it.abs.c_str(), &it.st)) {
+                int e2 = errno;
+                SPDLOG_ERROR("lstat failed for {}: {}", it.abs.c_str(), strerror(e2));
+                throw std::system_error(e2, std::generic_category(), "lstat failed: " + it.abs.string());
+            }
+            it.kind = tree_item::kSymlink;
+            it.text = fs::read_symlink(it.abs).string();
+            return true;
+        case DT_FIFO:
+        case DT_BLK:
+        case DT_CHR:
+        case DT_SOCK:
+            if (::lstat(it.abs.c_str(), &it.st)) {
+                int e2 = errno;
+                SPDLOG_ERROR("lstat failed for {}: {}", it.abs.c_str(), strerror(e2));
+                throw std::system_error(e2, std::generic_category(), "lstat failed: " + it.abs.string());
+            }
+            it.kind = tree_item::kMeta; // metadata-only (mode/rdev from st)
+            return true;
+        case DT_REG: {
+            if (we.ino == 0) { classify_stat(it); return true; } // no d_ino
+            auto key = std::make_pair(static_cast<std::uint64_t>(we.dir_dev),
+                                      static_cast<std::uint64_t>(we.ino));
+            if (auto found = d->inode_paths.find(key); found != d->inode_paths.end()) {
+                // Candidate duplicate: confirm with one stat — a stale or
+                // reused inode shows nlink 1 and is simply its own file.
+                if (::stat(it.abs.c_str(), &it.st)) {
+                    int e2 = errno;
+                    SPDLOG_ERROR("stat failed for {}: {}", it.abs.c_str(), strerror(e2));
+                    throw std::system_error(e2, std::generic_category(), "stat failed: " + it.abs.string());
+                }
+                if (it.st.st_nlink > 1) {
+                    it.kind = tree_item::kHardlinkDup;
+                    it.text = found->second;
+                } else {
+                    it.kind = tree_item::kFile;
+                }
+            } else {
+                // Owner (or single link): register for dup detection, no stat.
+                d->inode_paths[key] = it.rel;
+                it.kind = tree_item::kFile;
+            }
+            return true;
+        }
+        default: // DT_UNKNOWN (and anything exotic): one lstat tells us all
+            classify_stat(it);
+            return true;
+        }
     };
 
     // ---- consumption, strictly in walk order ----
@@ -1316,6 +1415,15 @@ void writer::add_tree(const std::filesystem::path& root, std::string store_prefi
                 if (fd < 0) {
                     int e2 = errno;
                     throw std::system_error(e2, std::generic_category(), "open failed: " + it.abs.string());
+                }
+                if (!S_ISREG(it.st.st_mode)) {
+                    // Stat-free walk (DT_REG fast path): fetch what the
+                    // pipeline's io worker would have fstat'ed.
+                    if (::fstat(fd, &it.st)) {
+                        int e2 = errno;
+                        ::close(fd);
+                        throw std::system_error(e2, std::generic_category(), "fstat failed: " + it.abs.string());
+                    }
                 }
                 d->add_file_impl(it.rel, it.abs,
                                  static_cast<std::uint64_t>(it.st.st_size), fd);

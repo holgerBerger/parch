@@ -130,10 +130,16 @@ Recursively archives the directory tree at `root`:
 - The walk STREAMS into the I/O pipeline: each file is submitted the moment
   discovery reaches it (up to `pipeline_depth` files stat/ed/opened/read
   concurrently), so archive bytes are written while the tree is still being
-  walked and discovery round-trips overlap with data flow — this is why
-  recursion is a first-class operation rather than a caller-side loop (a
-  serial loop re-creates the per-file network round-trip cost the archiver
-  exists to hide).
+  walked and discovery round-trips overlap with data flow. Regular files are
+  not stat'ed during discovery at all — classification comes from readdir
+  `d_type` and hardlink identity from `(dir dev, d_ino)` (both ride the
+  directory reads; on Lustre that means no per-file MDT getattr), with the
+  pipeline's post-open `fstat` as the size/mode/times authority; `DT_UNKNOWN`
+  or `d_ino == 0` filesystems (older NFS) fall back to lstat classification.
+  Only directories, symlinks, specials and dup-candidates pay a getattr.
+  This is why recursion is a first-class operation rather than a caller-side
+  loop (a serial loop re-creates the per-file network round-trip cost the
+  archiver exists to hide).
 - With a non-empty `store_prefix` (tar-style storage of the top level): the
   root itself becomes a directory entry named `store_prefix` (stored first,
   like tar lists `dir/`) and every descendant is stored under
