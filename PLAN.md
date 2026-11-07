@@ -484,8 +484,17 @@ block CRCs + decompress roundtrip, dedup single-store, tree relative paths).
     `block_permits` accounting, mirroring `src/io/pipeline.cpp`
     inverted) — only if a real-NFS benchmark shows read *bandwidth*
     (not RTs) as the residual limit after A.
+    **Lustre/GPFS analysis (§7)**: metadata RPCs cost 1–10 ms each and
+    dominate small-file restore — Option A owns that win entirely (B
+    adds nothing there), but A needs two amendments (§7.1: `pread`
+    outside the decode permit, directory-interleaved job order) and
+    B's bandwidth gate is **met by default** at that scale: single-stream
+    restore is one-OST-cursor-bound, stage separation + `block_permits`
+    as an explicit BDP dial (+ fadvise/O_DIRECT page-cache hygiene) are
+    the only way to approach aggregate OST bandwidth.
 35. ⬜ **Implement Option A** (steps in docs/extract-pipeline.md §3.2,
-    sequencing in §6) — starts only when scheduled post-v1.
+    sequencing in §6; §7.1 amendments if the target is Lustre/GPFS) —
+    starts only when scheduled post-v1.
 
 
 ## Dependencies

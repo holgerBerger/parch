@@ -6,6 +6,11 @@ netfs latency, `arch create` reaches 97.7 MiB/s (pipeline) but
 `extract_all` only 13.9 MiB/s — extraction parallelizes *decompression*
 but not the per-file *round-trip storm*, so it stays latency-bound.
 
+Which option, on which filesystem: **A always first** (it owns the
+metadata-RT win, which dominates small-file restore everywhere). B is
+"gated" on NFS-ish targets (§4) but **effectively required by default
+on Lustre/GPFS-class scale-out storage** — see §7.
+
 ## 1. Problem statement
 
 Extraction of a 20 000-file tree at 500 µs/file RT cost (warm cache,
@@ -120,7 +125,8 @@ Changes to code, in order of effect:
 3. **Split the pools**: file pool = `depth` (32) threads; a
    `std::counting_semaphore<int>` around the per-block CRC+decompress
    section keeps CPU parallelism at `threads`. Net effect: 32 concurrent
-   open/metadata RT chains, 4 concurrent zstd streams.
+   open/metadata RT chains, 4 concurrent zstd streams. (On Lustre/GPFS,
+   move the `pread` *outside* the semaphore — §7.1.)
 4. **Pool waves 1, 3, 4** on the same depth pool (they are pure-RT work:
    `mkdir`, `remove`+`link`, `chmod`/`chown`/`utimensat`/xattr on dirs).
    Wave 1 must keep parents-before-children: bucket jobs by path depth
@@ -246,3 +252,93 @@ longer the whole story):
   accounting).
 - Suggested sequencing: 3.2 steps 1–2 (pure win, no API change) →
   step 3 (options.depth) → steps 4–6 → measure → decide on Option B.
+
+## 7. Scale-out parallel filesystems (Lustre, GPFS) — how the balance shifts
+
+Phase 9's simulation models NFS-ish behavior (latency on open + first
+read). Lustre/GPFS at storage scale differ in three economically
+important ways:
+
+| resource | NFS-ish | Lustre/GPFS | consequence |
+|---|---|---|---|
+| metadata ops | ~1 RT each | **1–10 ms MDS/token RT each**, and *more* of them: xattrs live on the MDS, `chmod`/`chown`/`utimens` are one RPC apiece, same-directory creates convoy on the directory lock (Lustre) / inode-space token (GPFS) | metadata RPC count is the small-file currency — **Option A's domain; B adds nothing here** |
+| data path | single target, ~free | per-OST/per-node bandwidth ceiling; aggregate = stripes × per-OST; BDP at 100 Gb × ms-RTT ≈ **12–100 MB must be in flight** | in-flight bytes are the large-file currency — **A's permit placement caps them; B owns the knob** |
+| decode CPU | slack | ~0.5–1 GB/s/core (zstd-3) ⇒ a 12.5 GB/s client needs 16+ cores decoding while I/O stalls *longer* (ms) | I/O concurrency must be **decoupled** from codec concurrency |
+
+### 7.1 Option A — still necessary, but two design amendments
+
+A captures the entire metadata-side win (double-open removal halves the
+create-path MDS ops; fd-based xattr saves a lookup; `depth` overlaps the
+irreducible `chmod`/`fchown`/`futimens`/`setxattr` RPC storm — their
+*count* is unbatchable on Lustre, only their latency is hideable).
+But as specced in §3.2 the `pread` sits **inside** the decode permit:
+achieved archive-read concurrency = `threads` (4). At a 5 ms effective
+OST RT that is a 4×4 MiB/5 ms ≈ **3.2 GB/s hard ceiling**, with 28 of
+32 file workers idling. Amendments for this class of FS:
+
+1. **`pread` outside the permit.** The permit covers CRC + decompress
+   (CPU) only; every file worker may then have one block in flight →
+   `depth` × 4 MiB ≈ 128 MB, filling the BDP. Memory model becomes
+   worst-case `depth × 8 MiB` live buffers (one read-ahead + one
+   decoding) — for big-file-heavy trees that needs the same permit
+   accounting §3.1 waived, or `depth`-aware block read-ahead.
+2. **Job-order vs directory-convoy tension.** §3.2 step 6's
+   layout-order jobs optimize the (single, striped) archive stream, but
+   at the destination, 32 workers creating files in *the same source
+   directory* serialize on one MDS lock. Interleave wave-2 jobs across
+   directories (round-robin by parent) — layout order only ever helps
+   one fd's readahead, and striped Lustre reads parallelize *within* a
+   4 MiB op already (1 MiB stripes ⇒ 4 OSTs per pread — the frozen
+   4 MiB block size is stripe-friendly by construction).
+
+Neither amendment fixes the one structural hole: **single-huge-file
+restore** is one file = one worker = one cursor ≈ 1–2 concurrent block
+RPCs, roughly an order of magnitude off aggregate OST bandwidth on a
+big client. That case is Option B's, full stop.
+
+### 7.2 Option B — the gate (§4) is effectively *met by default* here
+
+On NFS-ish targets you might never be bandwidth-bound on restore, and
+B can stay hypothetical. On Lustre/GPFS the residual *is* bandwidth
+once A's metadata win lands:
+
+- Stage R's `readers` knob (in-flight bytes, independent of CPU) and
+  stage C's codec pool sizing are exactly the two dials a fat-NIC
+  restore needs — A merges them into worker bookkeeping and can only
+  approximate.
+- Big-file fan-out: stage R/C/W hand one file's blocks to multiple
+  writers (`pwrite` is order-free), so a single archive member streams
+  at min(NIC, stripes × per-OST, threads × decode speed) instead of
+  one worker's sequential cursor.
+- The `block_permits` pool becomes the explicit BDP dial (e.g. 64–128
+  × 4 MiB on a 100 Gb client) instead of an emergent property, and it
+  is the natural home for the page-cache hygiene this class of
+  deployment wants: restore reads of 100 GiB+ archives pollute the
+  client cache for nothing — `posix_fadvise(DONTNEED)` after each
+  consumed block, or an O_DIRECT stage R, neither of which fits the
+  monolithic file-worker model.
+
+### 7.3 What neither option buys
+
+- MDS RPC *count* per file (create + setattr ×3 + setxattr + flush) is
+  a protocol property — overlapping is all we can do. A
+  `--no-times`/`--no-owner`/bulk-restore switch that skips
+  restore_metadata subsets would cut RPCs rather than hide them;
+  cheap to add, policy call.
+- Hardlinks: `link()` is one cheap MDS op on Lustre — pooling wave 3
+  (A step 4) is enough.
+- The **writer-side pipeline already fits this class of FS** — it is
+  latency-bound across files (A/B don't touch it), and its per-block
+  `pwrite` at `depth`-32 is multi-OST parallel on a striped archive:
+  one of the format's quiet scale-out advantages.
+
+### 7.4 Benchmark follow-up
+
+`netfs_delay` should grow a *scale-out mode* before B's gate can be
+tested at all: delay **setattr/setxattr/unlink/link** (the MDS storm A
+overlaps — today only `open` is delayed, which underestimates Lustre
+metadata asymmetry), and optionally a token-bucket per-fd bandwidth cap
+to reproduce the aggregate-vs-single-stream gap. That plus a
+`--workload=hugefile` (single 8 GiB file) row would turn §4's "gate on
+measurement" into something measurable; a real Lustre/GPFS mount
+remains the only honest validation of B.
